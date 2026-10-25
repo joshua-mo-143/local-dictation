@@ -1,152 +1,175 @@
 from __future__ import annotations
 
+import io
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness.stt import launcher
-from local_voice_harness.user_config import DictationDevice, load_backend_environment
+from local_dictation.stt import launcher
+from local_dictation.user_config import ComputeDevice
 
 
-class DictationLauncherTests(unittest.TestCase):
-    def test_legacy_systemd_selector_defaults_are_resolver_baselines(self) -> None:
-        environment = {
-            "INVOCATION_ID": "service-start",
-            **launcher.LEGACY_UNIT_DEFAULTS,
-            "DICTATION_LANGUAGE": "en",
-        }
+def _passwd(home: Path) -> mock.Mock:
+    entry = mock.Mock()
+    entry.pw_dir = str(home)
+    return entry
 
-        resolved = launcher.resolver_environment(environment)
 
-        self.assertNotIn("DICTATION_BACKEND", resolved)
-        self.assertNotIn("DICTATION_MODEL", resolved)
-        self.assertNotIn("DICTATION_QUANTIZATION", resolved)
-        self.assertEqual(resolved["DICTATION_LANGUAGE"], "en")
-
-    def test_explicit_nondefault_environment_override_is_preserved(self) -> None:
-        resolved = launcher.resolver_environment(
-            {
-                "INVOCATION_ID": "service-start",
-                "DICTATION_BACKEND": "whisper",
-                "DICTATION_MODEL": "large-v3-turbo",
-            }
-        )
-
-        self.assertEqual(resolved["DICTATION_BACKEND"], "whisper")
-        self.assertEqual(resolved["DICTATION_MODEL"], "large-v3-turbo")
-
-    def test_backend_environment_accepts_only_documented_selectors(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "backend.env"
-            path.write_text(
-                "# backend selection\n"
-                "DICTATION_BACKEND=whisper\n"
-                "DICTATION_DEVICE=cpu\n"
-                "DICTATION_MODEL='large-v3-turbo'\n"
-                "DICTATION_LANGUAGE=en\n"
+class ProtectedEnvironmentTests(unittest.TestCase):
+    def test_paths_derive_from_account_home_and_session_runtime(self) -> None:
+        home = Path("/home/example")
+        with mock.patch.object(launcher.pwd, "getpwuid", return_value=_passwd(home)):
+            environment = launcher.protected_environment(
+                {"HOME": "/attacker", "XDG_RUNTIME_DIR": "/attacker/run"}, uid=1000
             )
 
-            environment = load_backend_environment(path)
-
+        self.assertEqual(set(environment), launcher.PROTECTED_ENVIRONMENT_KEYS)
         self.assertEqual(
             environment,
             {
-                "DICTATION_BACKEND": "whisper",
-                "DICTATION_DEVICE": "cpu",
-                "DICTATION_MODEL": "large-v3-turbo",
-                "DICTATION_LANGUAGE": "en",
+                "CUDA_CACHE_PATH": "/run/user/1000/local-dictation/cuda-cache",
+                "HF_HOME": "/home/example/.cache/huggingface",
+                "TMPDIR": "/run/user/1000/local-dictation",
+                "HOME": "/home/example",
+                "XDG_CACHE_HOME": "/home/example/.cache",
+                "XDG_RUNTIME_DIR": "/run/user/1000",
             },
         )
 
-    def test_backend_environment_rejects_protected_and_unknown_keys(self) -> None:
-        for assignment in (
-            "DICTATION_SOCKET=/tmp/attacker.sock",
-            "CUDA_CACHE_PATH=/home/user/cache",
-            "HF_HOME=/tmp/hf",
-            "TMPDIR=/tmp",
-            "XDG_RUNTIME_DIR=/tmp/runtime",
-            "LD_PRELOAD=/tmp/attack.so",
+    def test_development_runtime_override_moves_scratch_paths(self) -> None:
+        with mock.patch.object(
+            launcher.pwd, "getpwuid", return_value=_passwd(Path("/home/example"))
         ):
-            with (
-                self.subTest(assignment=assignment),
-                tempfile.TemporaryDirectory() as temporary,
-            ):
-                path = Path(temporary) / "backend.env"
-                path.write_text(f"{assignment}\n")
-                with self.assertRaisesRegex(
-                    ValueError, "unsupported backend environment key"
-                ):
-                    load_backend_environment(path)
-
-    def test_launcher_preserves_resolver_inputs_and_overwrites_owned_paths(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            home = Path(temporary)
-            config = home / ".config/dictation"
-            config.mkdir(parents=True)
-            (config / "backend.env").write_text(
-                "DICTATION_BACKEND=whisper\nDICTATION_COMPUTE=float16\n"
+            environment = launcher.protected_environment(
+                {"DICTATION_RUNTIME_DIR": "/run/user/1000/local-dictation-dev"},
+                uid=1000,
             )
-            owned = {
-                "DICTATION_SOCKET": "/run/user/1000/dictation.sock",
-                "CUDA_CACHE_PATH": "/run/user/1000/dictation/cuda-cache",
-                "HF_HOME": f"{home}/.cache/huggingface",
-                "TMPDIR": "/run/user/1000/dictation",
-                "HOME": str(home),
-                "XDG_CACHE_HOME": f"{home}/.cache",
-                "XDG_RUNTIME_DIR": "/run/user/1000",
-            }
-            inherited = {
-                key: f"/attacker/{key.casefold()}"
-                for key in launcher.PROTECTED_ENVIRONMENT_KEYS
-            }
-            inherited["XDG_CONFIG_HOME"] = str(home / ".config")
-            captured: dict[str, str] = {}
 
-            def inspect_execve(
-                _executable: str, _arguments: list[str], environment: dict[str, str]
-            ) -> None:
-                captured.update(environment)
-                raise RuntimeError("exec inspected")
+        self.assertEqual(environment["TMPDIR"], "/run/user/1000/local-dictation-dev")
+        self.assertEqual(
+            environment["CUDA_CACHE_PATH"],
+            "/run/user/1000/local-dictation-dev/cuda-cache",
+        )
 
-            with (
-                mock.patch.dict(os.environ, inherited, clear=True),
-                mock.patch.object(
-                    launcher, "protected_environment", return_value=owned
-                ),
-                mock.patch.object(launcher.site, "getsitepackages", return_value=[]),
-                mock.patch.object(launcher.os, "execve", side_effect=inspect_execve),
-                mock.patch.object(launcher.sys, "argv", ["voice-harness-dictation"]),
-                self.assertRaisesRegex(RuntimeError, "exec inspected"),
+
+class NvidiaLibraryPathTests(unittest.TestCase):
+    def test_wheel_libraries_are_prepended_to_existing_search_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            packages = Path(temporary)
+            library = packages / "nvidia" / "cublas" / "lib"
+            library.mkdir(parents=True)
+            not_a_directory = packages / "nvidia" / "nccl" / "lib"
+            not_a_directory.parent.mkdir()
+            not_a_directory.write_text("")
+            environment = {"LD_LIBRARY_PATH": "/opt/lib"}
+            with mock.patch.object(
+                launcher.site, "getsitepackages", return_value=[str(packages)]
             ):
-                launcher.main()
+                launcher.add_nvidia_library_paths(environment)
 
-        for key, expected in owned.items():
-            self.assertEqual(captured[key], expected)
-        self.assertEqual(captured["XDG_CONFIG_HOME"], str(home / ".config"))
-        self.assertNotIn("DICTATION_BACKEND", captured)
-        self.assertNotIn("DICTATION_COMPUTE", captured)
+        self.assertEqual(environment["LD_LIBRARY_PATH"], f"{library}:/opt/lib")
 
-    def test_cpu_launch_does_not_discover_nvidia_libraries(self) -> None:
-        config = mock.Mock()
-        config.compute.dictation_device = DictationDevice.CPU
+    def test_missing_wheel_libraries_leave_environment_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            environment: dict[str, str] = {}
+            with mock.patch.object(
+                launcher.site, "getsitepackages", return_value=[temporary]
+            ):
+                launcher.add_nvidia_library_paths(environment)
+
+        self.assertEqual(environment, {})
+
+
+class LauncherMainTests(unittest.TestCase):
+    def _launch(
+        self,
+        inherited: dict[str, str],
+        *,
+        device: ComputeDevice,
+        owned: dict[str, str] | None = None,
+    ) -> tuple[list[str], dict[str, str], mock.Mock]:
+        captured: dict[str, object] = {}
+        user_config = mock.Mock()
+        user_config.stt.device = device
+
+        def inspect_execve(
+            executable: str, arguments: list[str], environment: dict[str, str]
+        ) -> None:
+            captured.update(
+                executable=executable, arguments=arguments, environment=environment
+            )
+            raise RuntimeError("exec inspected")
+
         with (
-            mock.patch.dict(os.environ, {}, clear=True),
-            mock.patch.object(launcher, "protected_environment", return_value={}),
-            mock.patch.object(launcher, "load_user_config", return_value=config),
-            mock.patch.object(launcher, "add_nvidia_library_paths") as discover,
+            mock.patch.dict(os.environ, inherited, clear=True),
             mock.patch.object(
-                launcher.os, "execve", side_effect=RuntimeError("exec inspected")
+                launcher, "protected_environment", return_value=owned or {}
             ),
-            mock.patch.object(launcher.sys, "argv", ["voice-harness-dictation"]),
+            mock.patch.object(launcher, "load_user_config", return_value=user_config),
+            mock.patch.object(launcher, "add_nvidia_library_paths") as discover,
+            mock.patch.object(launcher.os, "execve", side_effect=inspect_execve),
+            mock.patch.object(launcher.sys, "argv", ["local-dictation-server"]),
             self.assertRaisesRegex(RuntimeError, "exec inspected"),
         ):
             launcher.main()
 
+        self.assertEqual(captured["executable"], launcher.sys.executable)
+        arguments = captured["arguments"]
+        environment = captured["environment"]
+        assert isinstance(arguments, list) and isinstance(environment, dict)
+        return arguments, environment, discover
+
+    def test_check_reports_ready_without_launching(self) -> None:
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                launcher.sys, "argv", ["local-dictation-server", "--check"]
+            ),
+            mock.patch.object(launcher.os, "execve") as execve,
+            redirect_stdout(output),
+        ):
+            launcher.main()
+
+        self.assertEqual(output.getvalue(), "local-dictation-server: ok\n")
+        execve.assert_not_called()
+
+    def test_owned_paths_replace_inherited_values_and_overrides_pass_through(
+        self,
+    ) -> None:
+        owned = {
+            key: f"/owned/{key.casefold()}"
+            for key in launcher.PROTECTED_ENVIRONMENT_KEYS
+        }
+        inherited = {
+            **{key: "/attacker" for key in launcher.PROTECTED_ENVIRONMENT_KEYS},
+            "XDG_CONFIG_HOME": "/config",
+            "DICTATION_BACKEND": "whisper",
+        }
+
+        arguments, environment, _discover = self._launch(
+            inherited, device=ComputeDevice.AUTO, owned=owned
+        )
+
+        self.assertEqual(arguments[1:], ["-m", "local_dictation.stt.server"])
+        for key, expected in owned.items():
+            self.assertEqual(environment[key], expected)
+        self.assertEqual(environment["XDG_CONFIG_HOME"], "/config")
+        self.assertEqual(environment["DICTATION_BACKEND"], "whisper")
+
+    def test_cpu_launch_does_not_discover_nvidia_libraries(self) -> None:
+        _arguments, _environment, discover = self._launch({}, device=ComputeDevice.CPU)
+
         discover.assert_not_called()
+
+    def test_auto_and_cuda_launches_discover_nvidia_libraries(self) -> None:
+        for device in (ComputeDevice.AUTO, ComputeDevice.CUDA):
+            with self.subTest(device=device):
+                _arguments, _environment, discover = self._launch({}, device=device)
+
+                discover.assert_called_once()
 
 
 if __name__ == "__main__":

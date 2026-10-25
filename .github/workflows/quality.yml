@@ -1,0 +1,78 @@
+name: Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Install development dependencies
+        run: uv sync --locked --python "$UV_PYTHON"
+      - name: Verify matrix interpreter
+        run: |
+          uv run --locked python -c \
+            'import os, sys; expected = tuple(map(int, os.environ["UV_PYTHON"].split("."))); assert sys.version_info[:2] == expected, sys.version'
+      - name: Check formatting
+        run: uv run --locked ruff format --check .
+      - name: Lint
+        run: uv run --locked ruff check .
+      - name: Type check
+        run: uv run --locked pyright --pythonversion "$UV_PYTHON"
+      - name: Verify staged systemd unit templates
+        run: |
+          uv run --locked python -m local_dictation.service_units \
+            --require-systemd-analyze
+      - name: Test
+        run: uv run --locked pytest
+      - name: Check risk-specific coverage
+        run: |
+          uv run --locked coverage json -o coverage.json
+          uv run --locked python -m local_dictation.coverage_gate coverage.json
+
+  production-extras:
+    name: Production extras ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Build wheel and smoke-check production extras
+        run: |
+          PYTHONPATH=src uv run --no-project python -m local_dictation.production_extras \
+            --python "$UV_PYTHON"

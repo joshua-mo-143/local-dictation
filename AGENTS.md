@@ -3,7 +3,7 @@
 Before editing:
 
 - State the behavioral invariant being changed and where production code currently owns it.
-- Trace the relevant data from input to every affected boundary and output. Search callers, adapters, compatibility facades, legacy paths, and distinct channels such as speech, display, logs, and model context.
+- Trace the relevant data from input to every affected boundary and output. Search callers, adapters, compatibility facades, legacy paths, and distinct channels such as typed text, the clipboard, notifications, and logs.
 - Identify mixed, ambiguous, partial-success, stale-state, and failure cases that could falsify the proposed fix.
 
 During implementation:
@@ -23,7 +23,7 @@ Before handing off:
 
 After completing code changes, always run the local equivalents of every CI check before handing off. Run formatting checks, linting, type checking, and the full test suite for every Python version in the CI matrix. Do not claim completion until those checks pass, or clearly report any check that could not be run and why.
 
-Use the repository-local development launcher (`scripts/dev.sh`) for relevant behavioral smoke tests so changes are exercised in the current checkout instead of relying solely on the automated test matrix. Follow `docs/development.md` for supported commands, isolation boundaries, and wake-listener safety. Before starting a smoke test that requires user-provided audio through an input source, notify the user and pause until they explicitly acknowledge that they are ready.
+Use the repository-local development launcher (`scripts/dev.sh`) for relevant behavioral smoke tests so changes are exercised in the current checkout instead of relying solely on the automated test matrix. Follow `docs/development.md` for supported commands and isolation boundaries; the launcher must never manage the installed service. Before starting a smoke test that requires user-provided audio through an input source, notify the user and pause until they explicitly acknowledge that they are ready.
 
 # Commits
 
@@ -36,7 +36,7 @@ Common types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`, `ci`, `build`,
 Examples:
 
 - `fix: harden recording and STT ownership`
-- `refactor(wake): strengthen agent boundaries`
+- `refactor(stt): simplify delivery acknowledgments`
 - `test: add runtime verification foundation`
 
 Use an imperative, present-tense summary. Do not end the subject line with a period.

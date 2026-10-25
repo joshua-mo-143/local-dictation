@@ -12,7 +12,7 @@ Josh files work by asking Cursor to write the ticket. The body is the entire bri
 
 Follow `.cursor/rules/issue-scope.mdc` for epic splits, dependency links, and one-PR scope. Do not restate it.
 
-This skill is for Cursor-authored tickets after investigation. Voice-harness drafts must stay faithful to the spoken request and must not invent acceptance criteria.
+This skill is for Cursor-authored tickets after investigation.
 
 ## Investigate first
 

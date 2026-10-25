@@ -10,9 +10,9 @@ import wave
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import vad
-from local_voice_harness.errors import HarnessError
-from local_voice_harness.user_config import default_user_config
+from local_dictation import vad
+from local_dictation.errors import DictationError
+from local_dictation.user_config import default_user_config
 
 
 def _settings(
@@ -178,7 +178,7 @@ class VadCaptureTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as temporary,
             mock.patch.object(vad.subprocess, "Popen", return_value=process),
-            self.assertRaisesRegex(HarnessError, "cancelled"),
+            self.assertRaisesRegex(DictationError, "cancelled"),
         ):
             vad.capture_vad_audio(
                 Path(temporary) / "capture.wav",
@@ -206,7 +206,7 @@ class VadCaptureTests(unittest.TestCase):
             with (
                 tempfile.TemporaryDirectory() as temporary,
                 mock.patch.object(vad.subprocess, "Popen", return_value=process),
-                self.assertRaisesRegex(HarnessError, "cancelled"),
+                self.assertRaisesRegex(DictationError, "cancelled"),
             ):
                 threading.Thread(target=request_stop_after_delay, daemon=True).start()
                 vad.capture_vad_audio(

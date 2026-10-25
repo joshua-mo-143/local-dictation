@@ -7,14 +7,13 @@ dist/
 build/
 .coverage
 .coverage.*
+coverage.json
 htmlcov/
 .pytest_cache/
 .ruff_cache/
-.migration-backup/
 
 # Download these during installation; do not commit model weights.
 models/
-*.gguf
 *.onnx
 *.safetensors
 

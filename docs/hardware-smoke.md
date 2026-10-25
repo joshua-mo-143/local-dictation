@@ -1,191 +1,112 @@
 # Opt-in hardware smoke checks
 
-These checks are manual and intentionally excluded from CI. They start local services,
-load GPU models, use the microphone and speakers, and may start a Herdr-managed Cursor
-agent. Run only the section whose side effects you intend, on the target workstation.
+These checks are manual and never run in CI. They use the microphone, load models
+on the GPU, and type into real windows. Run only the section whose side effects
+you want, on the machine you're testing. Every section except the first records
+speech, so make sure whoever is at the microphone is ready before starting.
 
-Before starting, install the project and services as described in the README. Open a
-second terminal for logs and keep `voice-harness services stop` available for cleanup.
+Install the project as described in [Installation](installation.md) first, and
+keep a second terminal open for logs:
 
-## PipeWire capture and playback
+```fish
+journalctl --user -u local-dictation -f
+```
 
-Entry point:
+## Service and environment
 
-```bash
+```fish
+dictate services status
+dictate doctor
+```
+
+Checklist:
+
+- The service is `active` and the log ends with `model ready`.
+- `dictate doctor` reports no failures, and the desktop row matches the session
+  (X11, Hyprland, or Sway can insert text; GNOME and KDE Wayland can't).
+
+## PipeWire capture
+
+```fish
 wpctl status
-pw-record --version
-pw-play --version
-voice-harness begin
-# Speak a short sentence.
-voice-harness end
+dictate config set dictation.source
+dictate config set dictation.inject stdout
+dictate begin
+# Say a short sentence.
+dictate end
 ```
 
 Checklist:
 
-- The configured source appears in `wpctl status`.
-- `begin` starts capture without an immediate PipeWire error.
-- `end` stops capture and reaches transcription.
-- A spoken response is audible on the intended sink, without overlap or truncation.
-- `journalctl --user -u voice-harness-wake.service -n 50` has no device errors.
+- The chosen source appears under the audio sources in `wpctl status`.
+- `begin` prints `recording` without a PipeWire error.
+- `end` prints the sentence you said.
+- `$XDG_RUNTIME_DIR/local-dictation/recordings/` is empty afterwards.
 
-If `end` or transcription fails, cancel any surviving recording before retrying.
-Then stop services started by the turn:
+## Inserting text
 
-```bash
-voice-harness cancel
-voice-harness services stop
-```
-
-## Speaker-to-microphone leakage
-
-This check must use the wake daemon so it can associate captured speech with its own
-recent playback. Start the services, follow the wake log in a second terminal, and
-temporarily avoid headphones:
-
-```bash
-voice-harness services start
-journalctl --user -u voice-harness-wake.service -f
-voice-harness listen
-# Say: Say exactly, tomorrow is another day.
-```
-
-Remain silent through playback and for ten seconds afterward. Then repeat the request
-and say “Hey Jarvis, stop” while the response is still playing.
+Set `dictation.inject` back to `auto`, then dictate into a text editor and into
+a terminal with `dictate toggle` bound to a key.
 
 Checklist:
 
-- Audible speaker output leaks into the configured microphone at the normal test
-  volume.
-- Silence after playback does not produce a `You:` turn or another assistant reply.
-- If STT recognizes the leaked response, the log says the follow-up matched recent
-  local playback.
-- The wake-word interruption still cancels playback and admits “stop” as user speech.
-- An ordinary, differently worded follow-up immediately after playback is admitted.
-- After ten seconds, repeating words from the response is no longer rejected solely
-  as recent playback.
+- The editor receives pasted text, and its previous clipboard contents come back
+  afterwards.
+- The terminal receives typed (or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd>
+  pasted) text.
+- Switching windows between the end of recording and insertion cancels the
+  insertion with a notification instead of typing into the new window.
 
-Clean up:
+## Voice-activated dictation
 
-```bash
-voice-harness services stop
+```fish
+dictate vad
 ```
+
+Say two separate sentences with a pause after each, stay quiet for a few
+seconds, then run `dictate vad` again from another terminal or key binding.
+
+Checklist:
+
+- Each sentence is transcribed and inserted after its pause, and the listener
+  rearms between them.
+- Silence and background noise don't produce empty insertions.
+- The second `dictate vad` stops the listener, and the first process exits.
 
 ## CUDA model loading
 
-Entry point:
-
-```bash
+```fish
 nvidia-smi
-llama-server --list-devices
-systemctl --user start dictation.service voice-harness-llm.service voice-harness-tts.service
-systemctl --user is-active dictation.service voice-harness-llm.service voice-harness-tts.service
-curl --fail http://127.0.0.1:8090/health
-journalctl --user -u dictation.service -u voice-harness-llm.service -u voice-harness-tts.service -n 100
+dictate config set stt.device cuda
+dictate services restart
+journalctl --user -u local-dictation -n 50
 ```
 
 Checklist:
 
-- `llama-server` lists the CUDA device configured in the LLM unit.
-- All three services remain active after their models load.
-- The llama.cpp health endpoint succeeds.
-- Logs identify CUDA providers/devices and contain no CPU fallback, missing model, or
-  out-of-memory error.
-- `nvidia-smi` shows the expected model processes and plausible VRAM use.
+- The log shows Parakeet loading on `CUDA` with no CPU fallback, missing library,
+  or out-of-memory error.
+- `nvidia-smi` lists the server process with plausible VRAM use.
+- A dictation round trip still works.
 
-Stop every service started by this isolated check:
+Return to your usual device setting afterwards.
 
-```bash
-systemctl --user stop voice-harness-tts.service voice-harness-llm.service dictation.service
-```
+## Recovery and retry
 
-## Herdr and Cursor handoff
-
-This check starts or reuses a Cursor agent but should not ask it to modify files.
-
-Entry point:
-
-```bash
-herdr status server
-herdr agent list
-voice-harness text "Use Cursor to inspect this repository and report its current branch without changing anything."
-herdr agent list
+```fish
+dictate config set dictation.inject stdout
+dictate begin
+# Say a short sentence.
+dictate services stop
+dictate end
+dictate services start
+# Wait for "model ready" in the log.
+dictate retry <path from the error>
 ```
 
 Checklist:
 
-- Herdr reports a running server.
-- The request selects the intended checkout.
-- Exactly one suitable agent handles the request.
-- The result returns to the harness and no repository files change.
-- `voice-harness status` shows no abandoned running job.
-
-Stop any voice services activated while delivering the result. Herdr and its retained
-agent are intentionally left running for inspection:
-
-```bash
-voice-harness services stop
-```
-
-## Durable job recovery across reboot
-
-Use a harmless Cursor request that remains active beyond the foreground timeout.
-Record its ID, then reboot the workstation rather than manually copying state:
-
-```bash
-state_home="$HOME/.local/state/voice-harness"
-if [[ -n ${STATE_DIRECTORY:-} ]]; then
-  IFS=: read -ra candidates <<<"$STATE_DIRECTORY"
-  for candidate in "${candidates[@]}"; do
-    if [[ $candidate == /*/voice-harness ]]; then
-      state_home=$candidate
-      break
-    fi
-  done
-elif [[ -n ${XDG_STATE_HOME:-} ]]; then
-  state_home="$XDG_STATE_HOME/voice-harness"
-fi
-voice-harness text "Use Cursor to inspect this repository and wait for my next instruction without changing files."
-ls "$state_home/jobs"
-# Reboot, sign back in, and start the wake service before continuing.
-systemctl --user start voice-harness-wake.service
-voice-harness status
-ls "$XDG_RUNTIME_DIR/voice-harness/jobs"
-```
-
-Checklist:
-
-- `jobs/jobs.sqlite3` survives under the state directory and no active job JSON is
-  recreated in the runtime jobs directory.
-- Recovery does not accept the pre-reboot PID/start-time ownership; it safely resumes
-  or reconciles the job.
-- Old worker logs do not survive the reboot or migrate into durable storage.
-- A delivered terminal fixture older than seven days is pruned, while undelivered,
-  uncertain, manual-review, and quarantine evidence remains.
-
-## End-to-end voice turn
-
-Start from stopped on-demand models so this check includes service activation:
-
-```bash
-voice-harness services start
-voice-harness services status
-```
-
-Say “Hey Jarvis, what time is it?” and wait for playback.
-
-Checklist:
-
-- Wake detection activates once.
-- Capture stops after the utterance and produces a non-empty transcription.
-- Dictation, LLM, and TTS become ready without manual intervention.
-- The response begins playing and the complete turn is audible.
-- A second ordinary turn succeeds with warm models.
-- Saying the wake phrase during playback cancels that playback and begins a new turn.
-- Service logs contain no traceback, stale socket, orphan process, or repeated restart.
-
-Clean up:
-
-```bash
-voice-harness services stop
-voice-harness services status
-```
+- `end` fails, and its diagnostic names the preserved recording and the
+  `dictate retry` command.
+- The recording stays in `recordings/` while the service is stopped.
+- `retry` prints the sentence and the recording is removed afterwards.

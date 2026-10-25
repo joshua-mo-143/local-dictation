@@ -14,8 +14,8 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import recorder
-from local_voice_harness.errors import HarnessError
+from local_dictation import recorder
+from local_dictation.errors import DictationError
 
 
 def _paths(root: Path) -> recorder.RecorderPaths:
@@ -25,27 +25,6 @@ def _paths(root: Path) -> recorder.RecorderPaths:
         root / "recording.pid",
         root / "pw-record.log",
     )
-
-
-def _cross_mode_paths(
-    root: Path,
-) -> tuple[recorder.RecorderPaths, recorder.RecorderPaths]:
-    shared_lock = root / "recording.lock"
-    manual = recorder.RecorderPaths(
-        root / "manual",
-        root / "manual" / "request.wav",
-        root / "manual" / "recording.pid",
-        root / "manual" / "pw-record.log",
-        shared_lock,
-    )
-    dictation = recorder.RecorderPaths(
-        root / "dictation",
-        root / "dictation" / "recording.wav",
-        root / "dictation" / "recording.pid",
-        root / "dictation" / "pw-record.log",
-        shared_lock,
-    )
-    return manual, dictation
 
 
 def _write_state(paths: recorder.RecorderPaths, identity: str) -> None:
@@ -106,7 +85,7 @@ class RecorderTests(unittest.TestCase):
 
             with (
                 mock.patch.object(recorder.time, "sleep") as sleep,
-                self.assertRaisesRegex(HarnessError, "target node is unavailable"),
+                self.assertRaisesRegex(DictationError, "target node is unavailable"),
             ):
                 recorder._wait_for_recorder(paths, process)
 
@@ -121,7 +100,7 @@ class RecorderTests(unittest.TestCase):
             with (
                 mock.patch.object(recorder.time, "monotonic", side_effect=[10.0, 11.0]),
                 mock.patch.object(recorder.time, "sleep") as sleep,
-                self.assertRaisesRegex(HarnessError, "within 1 seconds"),
+                self.assertRaisesRegex(DictationError, "within 1 seconds"),
             ):
                 recorder._wait_for_recorder(paths, process)
 
@@ -155,7 +134,7 @@ class RecorderTests(unittest.TestCase):
 
             def time_out(_paths: object, _process: object) -> None:
                 paths.audio.write_bytes(b"partial")
-                raise HarnessError("startup timeout")
+                raise DictationError("startup timeout")
 
             with (
                 mock.patch.object(recorder.subprocess, "Popen", return_value=process),
@@ -163,7 +142,7 @@ class RecorderTests(unittest.TestCase):
                 mock.patch.object(
                     recorder, "terminate_pidfd", return_value=True
                 ) as stop,
-                self.assertRaisesRegex(HarnessError, "startup timeout"),
+                self.assertRaisesRegex(DictationError, "startup timeout"),
             ):
                 recorder.start_recording(paths, source="", ready=lambda: True)
 
@@ -199,7 +178,7 @@ class RecorderTests(unittest.TestCase):
                     recorder, "process_identity", return_value="new-process"
                 ),
                 mock.patch.object(recorder, "_pidfd_send") as send,
-                self.assertRaisesRegex(HarnessError, "not currently recording"),
+                self.assertRaisesRegex(DictationError, "not currently recording"),
             ):
                 recorder.stop_recording(
                     paths, missing_message="not currently recording"
@@ -269,200 +248,6 @@ class RecorderTests(unittest.TestCase):
             stop.assert_called_once()
             self.assertFalse(paths.process.exists())
 
-    def test_cross_mode_live_owner_blocks_start_in_both_orderings(self) -> None:
-        identity = recorder.process_identity(os.getpid())
-        assert identity is not None
-        for owner_index in (0, 1):
-            with self.subTest(owner_index=owner_index):
-                with tempfile.TemporaryDirectory() as temporary:
-                    modes = _cross_mode_paths(Path(temporary))
-                    owner = modes[owner_index]
-                    contender = modes[1 - owner_index]
-                    _write_state(owner, identity)
-                    owner_audio = b"owner audio"
-                    contender_audio = b"contender audio"
-                    owner.audio.write_bytes(owner_audio)
-                    contender.state_dir.mkdir(parents=True)
-                    contender.audio.write_bytes(contender_audio)
-
-                    with (
-                        mock.patch.object(recorder.subprocess, "Popen") as popen,
-                        self.assertRaisesRegex(HarnessError, "another recording mode"),
-                    ):
-                        recorder.start_recording(
-                            contender,
-                            source="",
-                            ready=lambda: True,
-                            conflicts=(owner,),
-                        )
-
-                    popen.assert_not_called()
-                    self.assertEqual(owner.audio.read_bytes(), owner_audio)
-                    self.assertEqual(contender.audio.read_bytes(), contender_audio)
-                    self.assertTrue(owner.process.exists())
-                    self.assertFalse(contender.process.exists())
-
-    def test_stale_cross_mode_state_is_cleaned_before_start(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            manual, dictation = _cross_mode_paths(Path(temporary))
-            manual.state_dir.mkdir(parents=True)
-            manual.process.write_text(
-                json.dumps({"pid": 999_999_999, "process_start": "stale"})
-            )
-            manual_audio = b"completed manual audio"
-            manual.audio.write_bytes(manual_audio)
-            process = mock.Mock(pid=os.getpid(), returncode=None)
-            process.poll.return_value = None
-
-            with (
-                mock.patch.object(
-                    recorder.subprocess, "Popen", return_value=process
-                ) as popen,
-                mock.patch.object(recorder, "_wait_for_recorder"),
-            ):
-                recorder.start_recording(
-                    dictation,
-                    source="",
-                    ready=lambda: True,
-                    conflicts=(manual,),
-                )
-
-            popen.assert_called_once()
-            self.assertFalse(manual.process.exists())
-            self.assertEqual(manual.audio.read_bytes(), manual_audio)
-            self.assertTrue(dictation.process.exists())
-
-    def test_unverifiable_cross_mode_owner_blocks_without_touching_files(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            manual, dictation = _cross_mode_paths(Path(temporary))
-            manual.state_dir.mkdir(parents=True)
-            manual.process.write_text(str(os.getpid()))
-            manual.audio.write_bytes(b"manual audio")
-            dictation.state_dir.mkdir(parents=True)
-            dictation.audio.write_bytes(b"dictation audio")
-
-            with (
-                mock.patch.object(recorder, "_pidfd_exited", return_value=False),
-                mock.patch.object(
-                    recorder, "_legacy_command_matches", return_value=None
-                ),
-                mock.patch.object(recorder.subprocess, "Popen") as popen,
-                self.assertRaisesRegex(HarnessError, "cannot verify legacy"),
-            ):
-                recorder.start_recording(
-                    dictation,
-                    source="",
-                    ready=lambda: True,
-                    conflicts=(manual,),
-                )
-
-            popen.assert_not_called()
-            self.assertEqual(manual.process.read_text(), str(os.getpid()))
-            self.assertEqual(manual.audio.read_bytes(), b"manual audio")
-            self.assertEqual(dictation.audio.read_bytes(), b"dictation audio")
-
-    def test_simultaneous_cross_mode_starts_launch_exactly_one_process(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            manual, dictation = _cross_mode_paths(Path(temporary))
-            for mode in (manual, dictation):
-                mode.state_dir.mkdir(parents=True)
-                mode.audio.write_bytes(b"untouched contender audio")
-            process = mock.Mock(pid=os.getpid(), returncode=None)
-            process.poll.return_value = None
-            barrier = threading.Barrier(3)
-            errors: list[HarnessError] = []
-
-            def begin(
-                paths: recorder.RecorderPaths,
-                conflict: recorder.RecorderPaths,
-            ) -> None:
-                barrier.wait()
-                try:
-                    recorder.start_recording(
-                        paths,
-                        source="",
-                        ready=lambda: True,
-                        conflicts=(conflict,),
-                    )
-                except HarnessError as exc:
-                    errors.append(exc)
-
-            with (
-                mock.patch.object(
-                    recorder.subprocess, "Popen", return_value=process
-                ) as popen,
-                mock.patch.object(recorder, "_wait_for_recorder"),
-            ):
-                threads = [
-                    threading.Thread(target=begin, args=(manual, dictation)),
-                    threading.Thread(target=begin, args=(dictation, manual)),
-                ]
-                for thread in threads:
-                    thread.start()
-                barrier.wait()
-                for thread in threads:
-                    thread.join(2)
-
-            self.assertTrue(all(not thread.is_alive() for thread in threads))
-            popen.assert_called_once()
-            self.assertEqual(len(errors), 1)
-            self.assertRegex(str(errors[0]), "another recording mode")
-            self.assertEqual(
-                sum(mode.process.exists() for mode in (manual, dictation)), 1
-            )
-            self.assertEqual(
-                sum(mode.audio.exists() for mode in (manual, dictation)), 1
-            )
-
-    def test_real_legacy_process_blocks_other_mode_and_is_migrated(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            manual, dictation = _cross_mode_paths(Path(temporary))
-            manual.state_dir.mkdir(parents=True)
-            command = 'exec -a pw-record "$1" -c \'import time; time.sleep(30)\' "$2"'
-            process = subprocess.Popen(
-                [
-                    "bash",
-                    "-c",
-                    command,
-                    "legacy-recorder",
-                    sys.executable,
-                    str(manual.audio),
-                ]
-            )
-            try:
-                deadline = time.monotonic() + 2
-                while (
-                    recorder._legacy_command_matches(process.pid, manual.audio)
-                    is not True
-                    and time.monotonic() < deadline
-                ):
-                    time.sleep(0.01)
-                manual.process.write_text(str(process.pid))
-
-                with (
-                    mock.patch.object(recorder.subprocess, "Popen") as popen,
-                    self.assertRaisesRegex(HarnessError, "another recording mode"),
-                ):
-                    recorder.start_recording(
-                        dictation,
-                        source="",
-                        ready=lambda: True,
-                        conflicts=(manual,),
-                    )
-
-                popen.assert_not_called()
-                migrated = json.loads(manual.process.read_text())
-                self.assertEqual(migrated["pid"], process.pid)
-                self.assertEqual(
-                    migrated["process_start"],
-                    recorder.process_identity(process.pid),
-                )
-            finally:
-                process.terminate()
-                process.wait(timeout=2)
-
     def test_reused_legacy_pid_state_is_removed_without_signalling(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = _paths(Path(temporary))
@@ -522,7 +307,7 @@ class RecorderTests(unittest.TestCase):
                 mock.patch.object(
                     recorder, "_legacy_command_matches", return_value=None
                 ),
-                self.assertRaisesRegex(HarnessError, "cannot verify legacy"),
+                self.assertRaisesRegex(DictationError, "cannot verify legacy"),
             ):
                 recorder.recording_active(paths)
 
@@ -567,7 +352,7 @@ class RecorderTests(unittest.TestCase):
                 mock.patch.object(
                     recorder, "_pidfd_exited", side_effect=[False, False]
                 ),
-                self.assertRaisesRegex(HarnessError, "ownership was preserved"),
+                self.assertRaisesRegex(DictationError, "ownership was preserved"),
             ):
                 recorder.stop_recording(
                     paths, missing_message="not currently recording"
@@ -586,7 +371,7 @@ class RecorderTests(unittest.TestCase):
             with (
                 mock.patch.object(recorder, "_pidfd_send"),
                 mock.patch.object(recorder, "_pidfd_exited", return_value=False),
-                self.assertRaisesRegex(HarnessError, "ownership was preserved"),
+                self.assertRaisesRegex(DictationError, "ownership was preserved"),
             ):
                 recorder.cancel_recording(paths)
 
@@ -697,7 +482,7 @@ class RecorderTests(unittest.TestCase):
 
             with (
                 mock.patch.object(recorder, "_pidfd_send") as send,
-                self.assertRaisesRegex(HarnessError, "manual dictation"),
+                self.assertRaisesRegex(DictationError, "manual dictation"),
             ):
                 recorder.request_vad_stop(paths)
 
@@ -720,7 +505,7 @@ class RecorderTests(unittest.TestCase):
             recorder.claim_current_process(paths, mode="vad")
             paths.audio.write_bytes(b"RIFF-vad" + b"\0" * 64)
 
-            with self.assertRaisesRegex(HarnessError, "cancelled"):
+            with self.assertRaisesRegex(DictationError, "cancelled"):
                 recorder.complete_current_recording(
                     paths, mode="vad", cancelled=lambda: True
                 )
@@ -738,7 +523,7 @@ class RecorderTests(unittest.TestCase):
                 barrier.wait()
                 try:
                     recorder.claim_current_process(paths, mode="vad")
-                except HarnessError:
+                except DictationError:
                     results.append("blocked")
                 else:
                     results.append("claimed")
@@ -763,7 +548,7 @@ class RecorderTests(unittest.TestCase):
             contents = b"RIFF-active" + b"\0" * 64
             paths.audio.write_bytes(contents)
 
-            with self.assertRaisesRegex(HarnessError, "still active"):
+            with self.assertRaisesRegex(DictationError, "still active"):
                 recorder.handoff_recording(
                     paths, active_message="recording is still active"
                 )
@@ -774,13 +559,9 @@ class RecorderTests(unittest.TestCase):
     def test_retry_accepts_only_strict_pending_generation_when_idle(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = _paths(Path(temporary))
-
-            def write_audio(audio: Path) -> None:
-                audio.write_bytes(b"RIFF" + b"\0" * 64)
-
-            generation = recorder.write_audio_generation(
-                paths,
-                write_audio,
+            paths.audio.write_bytes(b"RIFF" + b"\0" * 64)
+            generation = recorder.handoff_recording(
+                paths, active_message="recording is active"
             )
 
             self.assertEqual(
@@ -791,12 +572,40 @@ class RecorderTests(unittest.TestCase):
                 ),
                 generation,
             )
-            with self.assertRaisesRegex(HarnessError, "not a harness"):
+            with self.assertRaisesRegex(DictationError, "not a dictation recording"):
                 recorder.retry_generation(
                     paths,
                     Path(temporary) / "arbitrary.wav",
                     active_message="recording is active",
                 )
+            missing = paths.generations / f"recording-{'0' * 32}.wav"
+            with self.assertRaisesRegex(DictationError, "does not exist"):
+                recorder.retry_generation(
+                    paths, missing, active_message="recording is active"
+                )
+            generation.write_bytes(b"RIFF")
+            with self.assertRaisesRegex(DictationError, "not safe to retry"):
+                recorder.retry_generation(
+                    paths, generation, active_message="recording is active"
+                )
+
+    def test_retry_is_rejected_while_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            paths.audio.write_bytes(b"RIFF" + b"\0" * 64)
+            generation = recorder.handoff_recording(
+                paths, active_message="recording is active"
+            )
+            identity = recorder.process_identity(os.getpid())
+            assert identity is not None
+            _write_state(paths, identity)
+
+            with self.assertRaisesRegex(DictationError, "recording is active"):
+                recorder.retry_generation(
+                    paths, generation, active_message="recording is active"
+                )
+
+            self.assertTrue(generation.exists())
 
     def test_recording_lock_serializes_across_processes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

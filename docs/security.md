@@ -1,62 +1,27 @@
-## Security notes
+# Security notes
 
-- Voice transcription can be wrong. Review all Cursor changes before committing.
-- Herdr agents are started with workspace trust but not Cursor `--force`.
-- Ticket and MCP content is treated as untrusted input and inferred paths are
-  validated against local Git repositories.
-- Focused GitHub issue and pull request content is read through `gh`, and rendered
-  Zendesk ticket content is copied from the browser session; all are bounded before
-  prompting and treated as untrusted external data.
-- Context integrations are gated by the built-in provider registry. GitHub remains
-  enabled by default for compatibility, but `[integrations] github = false` (or
-  `VOICE_HARNESS_INTEGRATION_GITHUB=0`) prevents GitHub URL/reference parsing,
-  context API calls, and downstream GitHub metadata. Zendesk is off unless
-  explicitly enabled; while disabled, Zendesk URLs are never inspected and no page
-  text is copied. An individual provider failing never breaks an ordinary voice
-  request.
-- Repository cloning requires explicit Rofi confirmation, accepts only HTTPS or SSH
-  Git URLs, and places the checkout beneath the configured project root.
-- Merely focusing a GitHub page cannot create a fork. The original spoken request must
-  unambiguously ask for one, and the user must separately confirm before the validated
-  public repository is forked.
-- GitHub issue creation is a dedicated external-write workflow. The target comes only
-  from the trusted utterance or validated focused repository, the exact bounded draft
-  is persisted and shown before a separate direct confirmation, and the body is passed
-  to `gh` over standard input rather than process arguments. A durable hidden
-  correlation marker lets recovery observe a timed-out creation without resubmitting;
-  an unprovable outcome stops for manual inspection.
-- Linear ticket creation uses a separate external-write workflow over the authenticated
-  Cursor Linear MCP integration. The team comes only from the trusted utterance or a
-  validated focused Linear team page, the bounded draft is persisted and displayed
-  before direct confirmation, and a correlation marker supports read-only recovery.
-  An ambiguous or unobservable result blocks for manual inspection rather than
-  resubmitting.
-- Checking out a focused pull request clones or reuses its repository below the GitHub
-  root and runs `gh pr checkout` only in a job-unique, reserved worktree. Recovery
-  retries that same worktree; failed preparation quarantines it.
-- Jobs never automatically commit, push, open pull requests, or remove worktrees.
-- Completed-job follow-ups reuse only the parent's exact, verified retained checkout:
-  the inherited repository, branch, worktree path, workspace, and pane are immutable;
-  the path is confirmed to be an isolated worktree (never the shared clone) that still
-  matches Herdr before dispatch; and unresolved live or quarantined evidence blocks
-  reuse. Agent startup uses a durably reserved target and retained pane, recovered
-  agents must report the exact checkout, and a prompt timeout keeps its target fenced
-  until cancellation. The completed parent is never reopened or mutated, prior agent
-  output is never injected into routing or worker prompts, opening a pull request
-  stays unsupported, and the in-memory follow-up reference is discarded on restart. Set
-  `VOICE_HARNESS_CURSOR_FOLLOWUP=0` to disable the feature.
-- Intent routing uses the configured LLM backend, but only a high-confidence
-  authoritative route can invoke Cursor. Conversation and low-confidence fallback are
-  tool-free.
-- Durable job records, workflow artifacts, and quarantine evidence live under the
-  private systemd `StateDirectory=voice-harness`, or
-  `$XDG_STATE_HOME/voice-harness` outside the service. Conversational audio, service
-  sockets, recorder ownership, and detached worker logs remain session-scoped under
-  `$XDG_RUNTIME_DIR`; focused dictation audio lives under
-  `$XDG_RUNTIME_DIR/dictation`.
-- The unauthenticated llama.cpp API is bound to `127.0.0.1` for this trusted
-  single-user workstation. Same-account processes are trusted; loopback is not a
-  per-UID boundary on a mutually untrusted multi-user host.
-- Shipped services use service-specific systemd hardening and bounded resources; see
-  the [hardening policy](service-hardening.md) for deliberate exceptions and host
-  checks.
+- Speech recognition runs locally. Audio, transcripts, and the vocabulary store
+  never leave the machine. Models download once from Hugging Face into
+  `~/.cache/huggingface`.
+- Transcription can be wrong, and dictated text goes straight into the focused
+  window. Check what was typed before you press <kbd>Enter</kbd> in a terminal.
+- Recordings, recorder ownership, logs, and the service socket are session data
+  under `$XDG_RUNTIME_DIR`. The runtime directory and its subdirectories are
+  private to your user (`0700`), audio claims are `0600`, and the socket is
+  `0600`.
+- The service only transcribes strictly named recording generations inside its
+  own runtime directory. It rejects any other path a client sends, so a process
+  that can reach the socket can't make the service read arbitrary files.
+- Every insertion re-checks the focused window and cancels if focus changed after
+  recording. Paste mode restores the previous clipboard unless something else
+  replaced it first.
+- Dictation refuses to record or insert while RuneLite has focus, because
+  simulated input may break Jagex's rules.
+- Service logs and command-failure diagnostics pass through a redaction filter
+  that removes common credential formats, and failure notifications show a
+  generic message instead of the error text. The service logs model loading,
+  recovery, and quarantine paths, but not transcripts.
+- `config.toml` and `vocabulary.json` are written atomically and owner-only.
+- The service runs with service-specific systemd hardening and bounded memory;
+  see the [hardening policy](service-hardening.md) for the deliberate
+  exceptions and host checks.

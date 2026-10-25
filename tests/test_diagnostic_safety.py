@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from local_voice_harness.diagnostic_safety import redact_diagnostic, redact_fields
+from local_dictation.diagnostic_safety import redact_diagnostic
 
 
 @pytest.mark.parametrize(
@@ -43,20 +43,3 @@ def test_redact_diagnostic_redacts_before_bounding_and_normalizes_lines() -> Non
     assert "\n" not in redacted
     assert secret not in redacted
     assert "[REDACTED]" in redacted
-
-
-def test_redact_fields_recurses_through_structured_log_values() -> None:
-    redacted = redact_fields(
-        {
-            "error": "password=hunter2",
-            "events": ["Authorization: Basic abc123", {"token": "token=secret"}],
-        }
-    )
-
-    assert redacted == {
-        "error": "password=[REDACTED]",
-        "events": [
-            "Authorization: [REDACTED]",
-            {"token": "token=[REDACTED]"},
-        ],
-    }

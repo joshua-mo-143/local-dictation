@@ -1,95 +1,111 @@
-## Troubleshooting
+# Troubleshooting
 
-Wake listener will not start:
+Start with the doctor. It checks the configuration, required executables, focus
+automation, the service environment, the model cache, the compute device, the
+PipeWire source, desktop support, the service, the socket, and the runtime
+directory, and it suggests a command for anything that fails:
 
-```bash
-voice-harness services status
-voice-harness services logs
+```fish
+dictate doctor
+dictate doctor --fix
 ```
 
-CUDA library or model errors:
+`--fix` offers the repairs it knows (restarting a failed service or removing a
+stale socket) and asks before each one.
 
-```bash
-journalctl --user -u dictation.service -u voice-harness-tts.service -n 100
+## A command says "The command failed"
+
+Failures show a generic notification, and the details go to standard error as
+one JSON line. Commands started from a key binding write that line to your
+window manager's log, so the quickest way to see it is to run the same command
+in a terminal:
+
+```fish
+dictate toggle
+```
+
+## "STT is stopped or still loading"
+
+The service isn't accepting connections yet. Right after a start or restart,
+it's still loading the model; the log ends with `model ready` once it's done.
+
+```fish
+dictate services status
+dictate services logs
+```
+
+## A transcription failed and kept the recording
+
+When the service is busy for longer than two minutes, stops mid-request, or
+fails, the recording stays under
+`$XDG_RUNTIME_DIR/local-dictation/recordings/` and the error names it. Once the
+service is healthy again, insert it with:
+
+```fish
+dictate retry $XDG_RUNTIME_DIR/local-dictation/recordings/recording-<uuid>.wav
+```
+
+If the service quarantined a file, the log names its path under
+`stt-quarantine/`. The service never removes quarantined audio, so inspect or
+delete it yourself. Like everything else in the runtime directory, it's gone
+after you log out.
+
+## The service won't start or keeps restarting
+
+```fish
+dictate services logs
+dictate services audit
+```
+
+A missing Python module usually means the installed engine extra doesn't match
+the configuration. `cpu` serves Parakeet on the CPU, `cuda` serves Parakeet on
+an NVIDIA GPU, and `whisper` adds faster-whisper. Re-run the installer with the
+device you want, or see
+[Installation](installation.md#engine-extras) to add faster-whisper.
+
+Explicit `cuda` fails at startup when the runtime can't see a CUDA device:
+
+```fish
 nvidia-smi
+dictate config set stt.device cpu
+dictate services restart
 ```
 
-If dictation reports a missing Python module, ensure the installed extra matches
-the backend and device: use `dictation` for CPU Parakeet, `dictation-cuda` for
-CUDA Parakeet, or `dictation-whisper` for faster-whisper, then restart
-`dictation.service`. Unknown backend or device names are rejected at startup.
-Explicit `cuda` also fails at startup when the selected runtime cannot see a CUDA
-device. Use `voice-harness config set compute.dictation_device cpu` for a strict
-CPU path that does not probe CUDA or search NVIDIA library directories.
+`cpu` never probes CUDA, which makes it a good way to rule the GPU out. CUDA
+provider errors in the log usually mean the CUDA or cuDNN libraries are
+missing; see [CUDA](installation.md#cuda).
 
-Herdr/Cursor failures:
+## Nothing gets typed
 
-```bash
-herdr status server
-herdr agent list
-agent status
-agent mcp list
+- Check the desktop row in `dictate doctor`. GNOME and KDE Wayland sessions
+  can't report the focused window, so only `stdout` works there.
+- Insertion cancels if focus changes between recording and typing. Keep the
+  target window focused until the text appears.
+- Dictation refuses to record or type while RuneLite has focus.
+- Set `dictation.inject` to `stdout` and run `dictate toggle` twice in a
+  terminal to check that transcription works on its own.
+
+## The wrong microphone, or VAD misbehaves
+
+Pick the capture source from the devices PipeWire reports:
+
+```fish
+wpctl status
+dictate config set dictation.source
 ```
 
-Job deletion reports unresolved quarantine evidence:
+If `dictate vad` triggers on background noise, raise
+`dictation.vad_min_speech_rms` or `dictation.vad_start_speech_frames`. If it
+cuts you off mid-sentence, raise `dictation.vad_end_silence_ms`. These apply to
+the next `dictate vad` you start.
 
-```bash
-voice-harness jobs quarantine list
-voice-harness jobs quarantine list --all --json
-```
+## The installed unit drifted
 
-The listing shows the quarantined payload and metadata paths plus any recorded
-worker identity, Herdr target, or worktree reservation. Verify those external
-resources no longer exist before releasing their fences. Then record what was
-checked and retry deletion:
+After pulling changes to the unit file, or if `dictate services audit` reports
+a mismatch:
 
-```bash
-voice-harness jobs quarantine acknowledge aaaaaaaaaaaa \
-  --reason "worker exited and no Herdr target or worktree remains"
-voice-harness jobs nuke
-```
-
-Acknowledgement requires typing `acknowledge` and writes a hash-bound resolution
-tombstone. It does not delete the quarantined payload or metadata. Do not
-acknowledge evidence merely to silence the warning: unresolved worker, agent,
-fork, or worktree operations must remain fenced until manually reconciled.
-
-SQLite storage or migration failures are reported by:
-
-```bash
-voice-harness doctor
-```
-
-The jobs diagnostics include the exact `jobs.sqlite3` path, database schema,
-migration status, integrity result, and unresolved import-failure count. Diagnostics
-are read-only and do not retry migration or quarantine files. If the database cannot
-be opened or fails its integrity check, stop the services and preserve the complete
-jobs directory before attempting recovery:
-
-```bash
-voice-harness services stop
-cp -a ~/.local/state/voice-harness/jobs \
-  ~/.local/state/voice-harness/jobs.forensics-"$(date +%Y%m%d-%H%M%S)"
-```
-
-Restore only a complete backup containing the database, WAL companions (if present),
-`.artifacts`, `.quarantine`, and archived JSON inputs. Never delete WAL files,
-reservations, or delivery claims individually; doing so can release a live target or
-lose an undelivered result. See `docs/durable-storage-migration.md` for the full
-backup and rollback limits.
-
-Wrong llama.cpp GPU:
-
-```bash
-llama-server --list-devices
-voice-harness config set compute.cuda_device '<LLAMA_CPP_DEVICE>'
-voice-harness services restart
-```
-
-After changing shipped units and intentionally adopting the bundled dictation unit:
-
-```bash
-voice-harness services install --force --replace-dictation
-voice-harness services audit
-voice-harness services restart
+```fish
+dictate services install --force
+dictate services audit
+dictate services restart
 ```

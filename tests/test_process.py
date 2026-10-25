@@ -10,8 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import process
-from local_voice_harness.errors import HarnessError
+from local_dictation import process
 
 
 class ProcessIdentityTests(unittest.TestCase):
@@ -56,7 +55,7 @@ class ProcessHandleTests(unittest.TestCase):
         self.assertIsNone(handle)
 
     def test_open_accepts_matching_owner(self) -> None:
-        from local_voice_harness.process import linux as process_linux
+        from local_dictation.process import linux as process_linux
 
         read_fd, write_fd = os.pipe()
         try:
@@ -80,7 +79,7 @@ class ProcessHandleTests(unittest.TestCase):
             os.close(write_fd)
 
     def test_terminate_pidfd_escalates_to_sigkill(self) -> None:
-        from local_voice_harness.process import linux as process_linux
+        from local_dictation.process import linux as process_linux
 
         with (
             mock.patch.object(process_linux, "pidfd_send") as send,
@@ -165,20 +164,6 @@ class CommandProcessGroupTests(unittest.TestCase):
                 os.kill(child_pid, 0)
             time.sleep(0.6)
             self.assertFalse(marker.exists())
-
-
-class WakeStateTests(unittest.TestCase):
-    def test_legacy_plain_pid_files_are_not_signalled(self) -> None:
-        from local_voice_harness.wake import daemon as wake_daemon
-
-        with tempfile.TemporaryDirectory() as temporary:
-            pid_path = Path(temporary) / "wake.pid"
-            pid_path.write_text("4321")
-            with (
-                mock.patch.object(wake_daemon, "WAKE_PID_PATH", pid_path),
-                self.assertRaisesRegex(HarnessError, "not running"),
-            ):
-                wake_daemon.request_listen()
 
 
 if __name__ == "__main__":

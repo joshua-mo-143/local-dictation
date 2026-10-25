@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import re
 import shutil
 import subprocess
@@ -8,281 +11,303 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import service_units
+from local_dictation import platform_services, service_units
+from local_dictation.config import SERVICE_NAME
+from local_dictation.user_config import default_user_config
+
+SHIPPED_UNIT = service_units.PROJECT_ROOT / service_units.SOURCE_RELATIVE / SERVICE_NAME
+MINIMAL_PYPROJECT = """\
+[project]
+name = "local-dictation"
+
+[project.scripts]
+local-dictation-server = "local_dictation.stt.launcher:main"
+
+[project.optional-dependencies]
+cpu = ["onnx-asr[hub]>=0.7.0", "onnxruntime>=1.20"]
+cuda = ["onnx-asr[gpu,hub]>=0.7.0"]
+"""
 
 
-class ServiceUnitValidationTests(unittest.TestCase):
-    def test_ci_explicitly_runs_staged_verifier_with_pinned_actions(self) -> None:
-        workflow = (
-            service_units.PROJECT_ROOT / ".github/workflows/quality.yml"
-        ).read_text()
+def _project(root: Path, *, unit: str | None = None, pyproject: str = "") -> Path:
+    """Stage a scratch project root with the shipped unit and a pyproject."""
 
-        self.assertIn("Verify staged systemd unit templates", workflow)
-        self.assertIn(
-            "python -m local_voice_harness.service_units \\\n"
-            "            --require-systemd-analyze",
-            workflow,
+    source = root / service_units.SOURCE_RELATIVE
+    shutil.copytree(SHIPPED_UNIT.parent, source)
+    if unit is not None:
+        (source / SERVICE_NAME).write_text(unit)
+    (root / "pyproject.toml").write_text(pyproject or MINIMAL_PYPROJECT)
+    return root
+
+
+def _security_errors(unit: str) -> list[str]:
+    with tempfile.TemporaryDirectory() as temporary:
+        return service_units.security_errors(_project(Path(temporary), unit=unit))
+
+
+def _consistency_errors(*, unit: str | None = None, pyproject: str = "") -> list[str]:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = _project(Path(temporary), unit=unit, pyproject=pyproject)
+        return service_units.consistency_errors(root)
+
+
+class CiWorkflowTests(unittest.TestCase):
+    def test_ci_runs_staged_verifier_with_pinned_actions(self) -> None:
+        workflows = sorted(
+            (service_units.PROJECT_ROOT / ".github" / "workflows").glob("*.y*ml")
         )
-        self.assertNotIn("--audit-installed", workflow)
-        action_lines = re.findall(
-            r"^\s*(?:-\s*)?uses:\s*(\S+)\s+#\s*(\S+)$", workflow, re.M
+        if not workflows:
+            self.skipTest("this checkout has no CI workflows")
+        verifier = re.compile(
+            r"python -m local_dictation\.service_units\s*(?:\\\s*)?"
+            r"--require-systemd-analyze"
         )
-        self.assertEqual(len(action_lines), workflow.count("uses:"))
-        for reference, version in action_lines:
-            with self.subTest(action=reference):
-                self.assertRegex(reference, r"^[^@]+@[0-9a-f]{40}$")
-                self.assertRegex(version, r"^v\d")
+        running = [path for path in workflows if verifier.search(path.read_text())]
+        self.assertTrue(running, "no CI workflow runs the staged unit verifier")
+        for path in running:
+            workflow = path.read_text()
+            self.assertNotIn("--audit-installed", workflow)
+            action_lines = re.findall(
+                r"^\s*(?:-\s*)?uses:\s*(\S+)\s+#\s*(\S+)$", workflow, re.M
+            )
+            self.assertEqual(len(action_lines), workflow.count("uses:"))
+            for reference, version in action_lines:
+                with self.subTest(workflow=path.name, action=reference):
+                    self.assertRegex(reference, r"^[^@]+@[0-9a-f]{40}$")
+                    self.assertRegex(version, r"^v\d")
 
-    def test_repository_units_have_parity_and_consistent_defaults(self) -> None:
+
+class ShippedUnitTests(unittest.TestCase):
+    def test_shipped_unit_has_parity_consistency_and_policy(self) -> None:
         self.assertEqual(service_units.parity_errors(), [])
         self.assertEqual(service_units.consistency_errors(), [])
         self.assertEqual(service_units.security_errors(), [])
 
-    def test_state_directory_is_service_owned_not_user_configurable(self) -> None:
-        wake = "voice-harness-wake.service"
-        self.assertIn("STATE_DIRECTORY", service_units.SERVICE_OWNED_ENVIRONMENT[wake])
-        self.assertNotIn(
-            "STATE_DIRECTORY", service_units.OPTIONAL_ENVIRONMENT_POLICY[wake]
+    def test_unit_runs_the_server_from_the_service_environment(self) -> None:
+        unit = SHIPPED_UNIT.read_text()
+
+        self.assertEqual(service_units.INSTALL_ROOT, "%h/local-dictation")
+        self.assertEqual(
+            service_units.EXPECTED_EXECSTART,
+            "%h/local-dictation/.venv-service/bin/local-dictation-server",
         )
-
-    def test_parity_checks_the_complete_inventory_and_contents(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project_root = Path(temporary)
-            source = project_root / service_units.SOURCE_RELATIVE
-            shutil.copytree(
-                service_units.PROJECT_ROOT / service_units.SOURCE_RELATIVE, source
-            )
-            (source / "voice-harness-llm.service").write_text("[Unit]\n")
-            (source / "unexpected.service").write_text("[Unit]\n")
-            (source / "dictation.service").unlink()
-
-            errors = service_units.parity_errors(project_root)
-
-        self.assertIn("source units missing: dictation.service", errors)
-        self.assertIn("source units unexpected: unexpected.service", errors)
-        self.assertIn(
-            "source and packaged units differ: voice-harness-llm.service", errors
+        self.assertIn("Description=Local dictation speech-to-text server\n", unit)
+        self.assertIn("WantedBy=default.target\n", unit)
+        self.assertEqual(
+            service_units.REQUIRED_ENVIRONMENT,
+            {
+                "CUDA_CACHE_PATH": "%t/local-dictation/cuda-cache",
+                "HF_HOME": "%h/.cache/huggingface",
+                "TMPDIR": "%t/local-dictation",
+            },
         )
+        self.assertNotIn("DICTATION_SOCKET", unit)
 
-    def test_security_policy_rejects_weakened_or_incompatible_units(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project_root = Path(temporary)
-            source = project_root / service_units.SOURCE_RELATIVE
-            shutil.copytree(
-                service_units.PROJECT_ROOT / service_units.SOURCE_RELATIVE, source
-            )
-            llm_path = source / "voice-harness-llm.service"
-            llm_path.write_text(
-                llm_path.read_text()
-                .replace("MemoryMax=8G", "MemoryMax=infinity")
-                .replace(
-                    "ProtectSystem=strict",
-                    "ProtectSystem=strict\n"
-                    "PrivateDevices=true\n"
-                    "SystemCallFilter=@system-service",
-                )
-            )
-
-            errors = service_units.security_errors(project_root)
-
-        self.assertIn(
-            "voice-harness-llm.service MemoryMax must be '8G', got 'infinity'",
-            errors,
-        )
-        self.assertIn(
-            "voice-harness-llm.service must not restrict CUDA devices with "
-            "PrivateDevices",
-            errors,
-        )
-        self.assertIn(
-            "voice-harness-llm.service must not set compatibility-sensitive "
-            "SystemCallFilter",
-            errors,
-        )
-
-    def test_security_policy_rejects_duplicates_resets_and_last_overrides(
+    def test_policy_keeps_the_shared_runtime_directory_and_resource_bounds(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project_root = Path(temporary)
-            source = project_root / service_units.SOURCE_RELATIVE
-            shutil.copytree(
-                service_units.PROJECT_ROOT / service_units.SOURCE_RELATIVE, source
-            )
-            llm_path = source / "voice-harness-llm.service"
-            llm_path.write_text(
-                llm_path.read_text()
-                .replace("MemoryMax=8G", "MemoryMax=8G\nMemoryMax=8G")
-                .replace(
-                    "ProtectHome=read-only",
-                    "ProtectHome=read-only\nProtectHome=\nProtectHome=false",
-                )
-                .replace(
-                    "NoNewPrivileges=true",
-                    "NoNewPrivileges=true\nNoNewPrivileges=false",
-                )
-                .replace(
-                    "Environment=CUDA_CACHE_PATH=%t/voice-harness-llm/cuda-cache",
-                    "Environment=CUDA_CACHE_PATH="
-                    "%t/voice-harness-llm/cuda-cache\n"
-                    "Environment=\n"
-                    "Environment=CUDA_CACHE_PATH=/tmp/cuda",
-                )
-            )
+        policy = service_units.SECURITY_POLICY
 
-            errors = service_units.security_errors(project_root)
-
-        self.assertIn(
-            "voice-harness-llm.service MemoryMax must have exactly one "
-            "assignment, got ['8G', '8G']",
-            errors,
-        )
-        self.assertIn(
-            "voice-harness-llm.service ProtectHome must have exactly one "
-            "assignment, got ['read-only', '', 'false']",
-            errors,
-        )
-        self.assertIn(
-            "voice-harness-llm.service NoNewPrivileges must have exactly one "
-            "assignment, got ['true', 'false']",
-            errors,
-        )
-        self.assertIn(
-            "voice-harness-llm.service Environment=CUDA_CACHE_PATH must be "
-            "assigned exactly once to "
-            "'%t/voice-harness-llm/cuda-cache', got "
-            "['%t/voice-harness-llm/cuda-cache', '<reset>', '/tmp/cuda']",
-            errors,
-        )
-
-    def test_security_policy_captures_each_services_resource_boundaries(self) -> None:
-        policy = service_units.SERVICE_SECURITY_POLICY
-
-        self.assertEqual(set(policy), set(service_units.SERVICE_FILES))
-        self.assertEqual(
-            set(service_units.OPTIONAL_ENVIRONMENT_POLICY),
-            set(service_units.SERVICE_FILES),
-        )
+        self.assertEqual(policy["RuntimeDirectory"], "local-dictation")
+        self.assertEqual(policy["RuntimeDirectoryMode"], "0700")
+        self.assertEqual(policy["RuntimeDirectoryPreserve"], "yes")
+        self.assertEqual(policy["ReadWritePaths"], "%t")
+        self.assertEqual(policy["ProtectHome"], "read-only")
+        self.assertEqual((policy["MemoryHigh"], policy["MemoryMax"]), ("4G", "6G"))
         self.assertTrue(
-            all(
-                not variables
-                for variables in service_units.OPTIONAL_ENVIRONMENT_POLICY.values()
+            service_units.REQUIRED_ENVIRONMENT["CUDA_CACHE_PATH"].startswith(
+                f"%t/{policy['RuntimeDirectory']}/"
             )
         )
-        configuration = (
-            service_units.PROJECT_ROOT / "docs" / "configuration.md"
-        ).read_text()
-        documented_wake_variables = set(
-            re.findall(
-                r"^\| `([A-Z0-9_]+)` .*\| Wake drop-in \|$",
-                configuration,
-                re.M,
-            )
-        )
-        self.assertEqual(
-            documented_wake_variables,
-            set(
-                service_units.OPTIONAL_ENVIRONMENT_POLICY["voice-harness-wake.service"]
-            ),
-        )
-        self.assertEqual(
-            policy["voice-harness-tts.service"]["RestrictAddressFamilies"],
-            "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
-        )
-        self.assertEqual(
-            policy["dictation.service"]["ReadWritePaths"],
-            "%t",
-        )
-        self.assertEqual(
-            policy["dictation.service"]["RuntimeDirectoryPreserve"],
-            "yes",
-        )
-        self.assertEqual(
-            policy["voice-harness-wake.service"]["ProtectHome"],
-            "false",
-        )
-        self.assertEqual(
-            policy["voice-harness-wake.service"]["StateDirectory"],
-            "voice-harness",
-        )
-        self.assertEqual(
-            policy["voice-harness-wake.service"]["StateDirectoryMode"],
-            "0700",
-        )
-        for name in service_units.GPU_SERVICES:
-            self.assertNotIn("PrivateDevices", policy[name])
-            runtime = service_units.CUDA_RUNTIME_DIRECTORIES[name]
-            cache = service_units.REQUIRED_ENVIRONMENT[name]["CUDA_CACHE_PATH"]
-            self.assertTrue(cache.startswith(f"%t/{runtime}/"))
-        self.assertEqual(
-            service_units.STT_SOCKET,
-            service_units.RUNTIME / "dictation.sock",
-        )
-        self.assertEqual(
-            service_units.TTS_SOCKET,
-            service_units.RUNTIME / "voice-harness-tts.sock",
-        )
-        self.assertEqual(
-            service_units.REQUIRED_ENVIRONMENT["dictation.service"]["DICTATION_SOCKET"],
-            "%t/dictation.sock",
-        )
-        self.assertNotIn(
-            "VOICE_HARNESS_TTS_SOCKET",
-            service_units.REQUIRED_ENVIRONMENT["voice-harness-tts.service"],
-        )
+        self.assertFalse(service_units.CUDA_DEVICE_RESTRICTIONS & set(policy))
+        self.assertIn("DevicePolicy", service_units.INTENTIONALLY_UNUSED_DIRECTIVES)
 
-    def test_tts_socket_override_is_rejected_to_preserve_compatibility(self) -> None:
+
+class ParityTests(unittest.TestCase):
+    def test_reports_unexpected_and_differing_source_units(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            project_root = Path(temporary)
-            source = project_root / service_units.SOURCE_RELATIVE
-            shutil.copytree(
-                service_units.PROJECT_ROOT / service_units.SOURCE_RELATIVE, source
+            root = _project(
+                Path(temporary), unit=SHIPPED_UNIT.read_text() + "# edited\n"
             )
-            path = source / "voice-harness-tts.service"
-            path.write_text(
-                path.read_text().replace(
-                    "Environment=HF_HUB_OFFLINE=1",
-                    "Environment=HF_HUB_OFFLINE=1\n"
-                    "Environment=VOICE_HARNESS_TTS_SOCKET=%t/other.sock",
-                )
+            (root / service_units.SOURCE_RELATIVE / "dictation.service").write_text(
+                "[Unit]\n"
             )
 
-            errors = service_units.security_errors(project_root)
+            errors = service_units.parity_errors(root)
 
+        self.assertIn("source units unexpected: dictation.service", errors)
+        self.assertIn(f"source and packaged units differ: {SERVICE_NAME}", errors)
+
+    def test_reports_missing_source_unit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = _project(Path(temporary))
+            (root / service_units.SOURCE_RELATIVE / SERVICE_NAME).unlink()
+
+            errors = service_units.parity_errors(root)
+
+        self.assertEqual(errors, [f"source units missing: {SERVICE_NAME}"])
+
+
+class SecurityPolicyTests(unittest.TestCase):
+    def test_rejects_weakened_or_incompatible_unit(self) -> None:
+        errors = _security_errors(
+            SHIPPED_UNIT.read_text()
+            .replace("MemoryMax=6G", "MemoryMax=infinity")
+            .replace(
+                "ProtectSystem=strict",
+                "ProtectSystem=strict\nPrivateDevices=true\n"
+                "SystemCallFilter=@system-service",
+            )
+        )
+
+        self.assertIn(f"{SERVICE_NAME} MemoryMax must be '6G', got 'infinity'", errors)
         self.assertIn(
-            "voice-harness-tts.service must use the fixed compatible socket",
+            f"{SERVICE_NAME} must not restrict CUDA devices with PrivateDevices",
+            errors,
+        )
+        self.assertIn(
+            f"{SERVICE_NAME} must not set compatibility-sensitive SystemCallFilter",
             errors,
         )
 
-    def test_all_templates_reject_unrestricted_environment_files(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            project_root = Path(temporary)
-            source = project_root / service_units.SOURCE_RELATIVE
-            shutil.copytree(
-                service_units.PROJECT_ROOT / service_units.SOURCE_RELATIVE, source
+    def test_rejects_duplicates_resets_and_last_overrides(self) -> None:
+        errors = _security_errors(
+            SHIPPED_UNIT.read_text()
+            .replace("MemoryMax=6G", "MemoryMax=6G\nMemoryMax=6G")
+            .replace(
+                "ProtectHome=read-only",
+                "ProtectHome=read-only\nProtectHome=\nProtectHome=false",
             )
-            for name in service_units.SERVICE_FILES:
-                path = source / name
-                path.write_text(
-                    path.read_text().replace(
-                        "[Service]",
-                        "[Service]\nEnvironmentFile=-%h/.config/unsafe.env",
+            .replace(
+                "NoNewPrivileges=true", "NoNewPrivileges=true\nNoNewPrivileges=false"
+            )
+            .replace(
+                "Environment=CUDA_CACHE_PATH=%t/local-dictation/cuda-cache",
+                "Environment=CUDA_CACHE_PATH=%t/local-dictation/cuda-cache\n"
+                "Environment=\n"
+                "Environment=CUDA_CACHE_PATH=/tmp/cuda",
+            )
+        )
+
+        self.assertIn(
+            f"{SERVICE_NAME} MemoryMax must have exactly one assignment, "
+            "got ['6G', '6G']",
+            errors,
+        )
+        self.assertIn(
+            f"{SERVICE_NAME} ProtectHome must have exactly one assignment, "
+            "got ['read-only', '', 'false']",
+            errors,
+        )
+        self.assertIn(
+            f"{SERVICE_NAME} NoNewPrivileges must have exactly one assignment, "
+            "got ['true', 'false']",
+            errors,
+        )
+        self.assertIn(
+            f"{SERVICE_NAME} Environment=CUDA_CACHE_PATH must be assigned exactly "
+            "once to '%t/local-dictation/cuda-cache', got "
+            "['%t/local-dictation/cuda-cache', '<reset>', '/tmp/cuda']",
+            errors,
+        )
+
+    def test_rejects_unrestricted_environment_files(self) -> None:
+        errors = _security_errors(
+            SHIPPED_UNIT.read_text().replace(
+                "[Service]", "[Service]\nEnvironmentFile=-%h/.config/unsafe.env"
+            )
+        )
+
+        self.assertIn(
+            f"{SERVICE_NAME} must not import unrestricted EnvironmentFile values",
+            errors,
+        )
+
+    def test_rejects_user_settings_and_socket_overrides_in_the_unit(self) -> None:
+        errors = _security_errors(
+            SHIPPED_UNIT.read_text().replace(
+                "[Service]",
+                "[Service]\nEnvironment=DICTATION_DEVICE=cuda\n"
+                "Environment=DICTATION_SOCKET=%t/dictation.sock",
+            )
+        )
+
+        self.assertIn(
+            f"{SERVICE_NAME} Environment keys must be exactly "
+            "['CUDA_CACHE_PATH', 'HF_HOME', 'TMPDIR'], got "
+            "['CUDA_CACHE_PATH', 'DICTATION_DEVICE', 'DICTATION_SOCKET', "
+            "'HF_HOME', 'TMPDIR']",
+            errors,
+        )
+
+    def test_rejects_unsandboxed_replaced_or_extended_execstart(self) -> None:
+        expected = service_units.EXPECTED_EXECSTART
+        for replacement in (
+            f"ExecStart=+{expected}",
+            f"ExecStart={expected} --listen 0.0.0.0",
+            f"ExecStart={expected}\nExecStart=\nExecStart=/usr/bin/python -m x",
+            f"ExecStart={expected}\nExecStart={expected}",
+        ):
+            with self.subTest(replacement=replacement):
+                errors = _security_errors(
+                    SHIPPED_UNIT.read_text().replace(
+                        f"ExecStart={expected}", replacement
                     )
                 )
-
-            errors = service_units.security_errors(project_root)
-
-        for name in service_units.SERVICE_FILES:
-            with self.subTest(service=name):
-                self.assertIn(
-                    f"{name} must not import unrestricted EnvironmentFile values",
+                self.assertTrue(
+                    any("effective ExecStart must be" in error for error in errors),
                     errors,
                 )
 
-    def test_systemd_analyze_is_optional_when_not_installed(self) -> None:
-        with mock.patch.object(service_units.shutil, "which", return_value=None):
-            self.assertIsNone(service_units.systemd_analyze([]))
 
+class ConsistencyTests(unittest.TestCase):
+    def test_minimal_project_is_consistent(self) -> None:
+        self.assertEqual(_consistency_errors(), [])
+
+    def test_requires_the_server_entry_point_the_unit_executes(self) -> None:
+        errors = _consistency_errors(
+            pyproject=MINIMAL_PYPROJECT.replace(
+                "local_dictation.stt.launcher:main", "local_dictation.stt.server:main"
+            )
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("local-dictation-server", errors[0])
+
+    def test_requires_service_extras_to_install_the_default_backend(self) -> None:
+        errors = _consistency_errors(
+            pyproject=MINIMAL_PYPROJECT.replace(
+                'cuda = ["onnx-asr[gpu,hub]>=0.7.0"]', 'cuda = ["onnxruntime-gpu"]'
+            )
+        )
+
+        self.assertEqual(
+            errors, ["cuda extra does not install the default parakeet backend"]
+        )
+
+    def test_runtime_directory_must_be_the_one_client_and_server_share(self) -> None:
+        errors = _consistency_errors(
+            unit=SHIPPED_UNIT.read_text().replace(
+                "RuntimeDirectory=local-dictation", "RuntimeDirectory=dictation"
+            )
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("RuntimeDirectory", errors[0])
+        self.assertIn("'dictation'", errors[0])
+
+    def test_environment_must_match_what_the_launcher_forces(self) -> None:
+        errors = _consistency_errors(
+            unit=SHIPPED_UNIT.read_text().replace(
+                "Environment=TMPDIR=%t/local-dictation", "Environment=TMPDIR=%t/tmp"
+            )
+        )
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Environment=TMPDIR", errors[0])
+
+
+class StageExecutableStubTests(unittest.TestCase):
     def test_stages_normal_absolute_executable_inside_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "root"
@@ -293,7 +318,6 @@ class ServiceUnitValidationTests(unittest.TestCase):
             self.assertEqual(staged, root.resolve() / "usr/local/bin/tool")
             self.assertTrue(staged.is_file())
             self.assertTrue(staged.stat().st_mode & 0o111)
-            self.assertTrue(staged.resolve().is_relative_to(root.resolve()))
 
     def test_rejects_lexical_traversal_and_non_normalized_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -303,8 +327,8 @@ class ServiceUnitValidationTests(unittest.TestCase):
             outside = base / "outside"
 
             for executable in (
+                "relative/tool",
                 "/../outside/tool",
-                "/../../outside/tool",
                 "/usr/../outside/tool",
                 "/usr/./bin/tool",
                 "/usr//bin/tool",
@@ -338,53 +362,76 @@ class ServiceUnitValidationTests(unittest.TestCase):
                 service_units.stage_executable_stub(destination_root, "/usr/bin/tool")
             self.assertFalse(outside_target.exists())
 
-    def test_systemd_analyze_stages_missing_commands_and_known_dependencies(
-        self,
-    ) -> None:
+
+class SystemdAnalyzeTests(unittest.TestCase):
+    def test_is_optional_when_not_installed(self) -> None:
+        with mock.patch.object(service_units.shutil, "which", return_value=None):
+            self.assertIsNone(service_units.systemd_analyze([SHIPPED_UNIT]))
+
+    def test_stages_the_server_executable_and_dependency_stubs(self) -> None:
         completed = subprocess.CompletedProcess([], 0, "", "")
-        paths = [
-            service_units.PROJECT_ROOT / service_units.SOURCE_RELATIVE / name
-            for name in service_units.SERVICE_FILES
-        ]
 
         def inspect_staging(
             arguments: list[str], **options: object
         ) -> subprocess.CompletedProcess[str]:
-            self.assertEqual(arguments[1], "--user")
+            self.assertEqual(arguments[:2], ["/tool", "--user"])
             root = Path(arguments[2].removeprefix("--root="))
-            self.assertEqual(arguments[3:6], ["--man=no", "--generators=no", "verify"])
-            self.assertEqual(arguments[6:], list(service_units.SERVICE_FILES))
             self.assertEqual(
-                options,
-                {"capture_output": True, "text": True, "check": False},
+                arguments[3:], ["--man=no", "--generators=no", "verify", SERVICE_NAME]
             )
-            expected_commands = (
-                Path.home()
-                / "local-voice-harness/.venv-dictation/bin/voice-harness-dictation",
-                Path.home() / "local-voice-harness/.venv/bin/voice-harness-llm",
-                Path.home() / "local-voice-harness/.venv/bin/voice-harness-wake",
-                Path.home() / "chatterbox-audition/.venv/bin/voice-harness-tts",
+            self.assertEqual(
+                options, {"capture_output": True, "text": True, "check": False}
             )
-            for command in expected_commands:
-                staged = root / command.relative_to("/")
-                self.assertTrue(staged.is_file(), command)
-                self.assertTrue(staged.stat().st_mode & 0o111, command)
+            server = Path(
+                service_units.EXPECTED_EXECSTART.replace("%h", str(Path.home()))
+            )
+            staged = root / server.relative_to("/")
+            self.assertTrue(staged.is_file())
+            self.assertTrue(staged.stat().st_mode & 0o111)
             for name in service_units.EXTERNAL_UNIT_STUBS:
                 self.assertTrue((root / "etc/systemd/user" / name).is_file())
+            staged_unit = (root / "etc/systemd/user" / SERVICE_NAME).read_text()
+            self.assertTrue(staged_unit.startswith(SHIPPED_UNIT.read_text()))
+            self.assertTrue(staged_unit.endswith("DefaultDependencies=no\n"))
             return completed
 
         with mock.patch.object(
             service_units.subprocess, "run", side_effect=inspect_staging
         ):
-            result = service_units.systemd_analyze(paths, executable="/tool")
+            result = service_units.systemd_analyze([SHIPPED_UNIT], executable="/tool")
 
-        self.assertIsNotNone(result)
         assert result is not None
         self.assertIs(result.process, completed)
         self.assertEqual(result.context, "staged-user")
         self.assertEqual(result.rooted_user_context, "supported")
 
-    def test_runtime_directory_lookup_failure_is_unsupported_user_context(self) -> None:
+    def test_does_not_stub_an_invented_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / SERVICE_NAME
+            source.write_text(
+                SHIPPED_UNIT.read_text().replace(
+                    "bin/local-dictation-server", "bin/local-dictation-sever"
+                )
+            )
+
+            def inspect_staging(
+                arguments: list[str], **_options: object
+            ) -> subprocess.CompletedProcess[str]:
+                root = Path(arguments[2].removeprefix("--root="))
+                self.assertFalse(
+                    any(path.is_file() for path in root.rglob("local-dictation-se*"))
+                )
+                return subprocess.CompletedProcess([], 1, "", "missing executable")
+
+            with mock.patch.object(
+                service_units.subprocess, "run", side_effect=inspect_staging
+            ):
+                result = service_units.systemd_analyze([source], executable="/tool")
+
+        assert result is not None
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_unsupported_user_context_markers(self) -> None:
         self.assertTrue(
             service_units.user_context_unsupported(
                 "Failed to lookup RuntimeDirectory path: No such device or address\n"
@@ -396,459 +443,41 @@ class ServiceUnitValidationTests(unittest.TestCase):
         )
         self.assertFalse(service_units.user_context_unsupported("missing executable"))
 
-    def test_systemd_analyze_falls_back_when_runtime_directory_lookup_fails(
-        self,
-    ) -> None:
-        path = (
-            service_units.PROJECT_ROOT
-            / service_units.SOURCE_RELATIVE
-            / "voice-harness-llm.service"
-        )
-        unsupported = subprocess.CompletedProcess(
-            [],
-            1,
-            "",
+    def test_falls_back_to_system_context_when_rooted_user_mode_fails(self) -> None:
+        for reason in (
             "Failed to lookup RuntimeDirectory path: No such device or address",
-        )
-        completed = subprocess.CompletedProcess([], 0, "", "")
-
-        with mock.patch.object(
-            service_units.subprocess,
-            "run",
-            side_effect=[unsupported, completed],
-        ) as run:
-            result = service_units.systemd_analyze([path], executable="/tool")
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(result.context, "staged-system")
-        self.assertEqual(result.rooted_user_context, "unsupported")
-        self.assertIn("RuntimeDirectory", result.reason or "")
-        self.assertEqual(run.call_count, 2)
-
-    def test_systemd_analyze_falls_back_when_rooted_user_mode_is_unsupported(
-        self,
-    ) -> None:
-        path = (
-            service_units.PROJECT_ROOT
-            / service_units.SOURCE_RELATIVE
-            / "voice-harness-llm.service"
-        )
-        unsupported = subprocess.CompletedProcess(
-            [],
-            1,
-            "",
-            "Failed to initialize unit search paths for root directory: "
-            "Invalid argument",
-        )
-        completed = subprocess.CompletedProcess([], 0, "", "")
-
-        with mock.patch.object(
-            service_units.subprocess,
-            "run",
-            side_effect=[unsupported, completed],
-        ) as run:
-            result = service_units.systemd_analyze([path], executable="/tool")
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertIs(result.process, completed)
-        self.assertEqual(result.context, "staged-system")
-        self.assertEqual(result.rooted_user_context, "unsupported")
-        self.assertIn("Invalid argument", result.reason or "")
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[0].args[0][1], "--user")
-        self.assertTrue(run.call_args_list[1].args[0][1].startswith("--root="))
-
-    def test_require_user_context_fails_on_honest_unsupported_result(self) -> None:
-        verification = service_units.StagedVerification(
-            subprocess.CompletedProcess([], 0, "", ""),
-            context="staged-system",
-            rooted_user_context="unsupported",
-            reason="Invalid argument",
-        )
-        with (
-            mock.patch.object(service_units, "parity_errors", return_value=[]),
-            mock.patch.object(service_units, "consistency_errors", return_value=[]),
-            mock.patch.object(service_units, "security_errors", return_value=[]),
-            mock.patch.object(
-                service_units, "systemd_analyze", return_value=verification
-            ),
-            mock.patch("builtins.print") as output,
+            "Failed to initialize unit search paths for root directory "
+            "/tmp/root: Invalid argument",
         ):
-            result = service_units.main(
-                ["--require-systemd-analyze", "--require-user-context"]
-            )
+            with self.subTest(reason=reason):
+                unsupported = subprocess.CompletedProcess([], 1, "", reason)
+                completed = subprocess.CompletedProcess([], 0, "", "")
+                with mock.patch.object(
+                    service_units.subprocess,
+                    "run",
+                    side_effect=[unsupported, completed],
+                ) as run:
+                    result = service_units.systemd_analyze(
+                        [SHIPPED_UNIT], executable="/tool"
+                    )
 
-        self.assertEqual(result, 1)
-        messages = [str(call) for call in output.call_args_list]
-        self.assertTrue(any("staged-system" in message for message in messages))
-        self.assertTrue(any("unsupported" in message for message in messages))
-
-    def test_systemd_analyze_does_not_stub_an_invented_executable(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary) / "voice-harness-llm.service"
-            source.write_text(
-                (
-                    service_units.PROJECT_ROOT
-                    / service_units.SOURCE_RELATIVE
-                    / source.name
-                )
-                .read_text()
-                .replace("/usr/sbin/llama-server", "/usr/sbin/llama-sevrer")
-            )
-
-            def inspect_staging(
-                arguments: list[str], **_options: object
-            ) -> subprocess.CompletedProcess[str]:
-                root = Path(arguments[2].removeprefix("--root="))
-                invented = root / "usr/sbin/llama-sevrer"
-                expected = root / "usr/sbin/llama-server"
-                self.assertFalse(invented.exists())
-                self.assertFalse(expected.exists())
-                return subprocess.CompletedProcess([], 1, "", "missing executable")
-
-            with mock.patch.object(
-                service_units.subprocess, "run", side_effect=inspect_staging
-            ):
-                result = service_units.systemd_analyze([source], executable="/tool")
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertNotEqual(result.returncode, 0)
-
-    def test_installed_audit_reads_effective_unit_and_runtime_state(self) -> None:
-        name = "voice-harness-llm.service"
-        observational = {
-            "ActiveState",
-            "SubState",
-            "Result",
-            "NRestarts",
-            "ExecMainStatus",
-            "MemoryCurrent",
-            "TasksCurrent",
-            "Environment",
-            "ExecStart",
-        }
-        self.assertEqual(
-            set(service_units._audit_expected_properties(name)),
-            set(service_units.AUDIT_SHOW_PROPERTIES) - observational,
-        )
-        unit = (
-            service_units.PROJECT_ROOT / service_units.SOURCE_RELATIVE / name
-        ).read_text()
-        command = service_units._expanded_unit_value(
-            service_units.EXPECTED_EXECSTART[name]
-        )
-        properties = {
-            **service_units._audit_expected_properties(name),
-            "ActiveState": "inactive",
-            "SubState": "dead",
-            "Result": "success",
-            "NRestarts": "0",
-            "ExecMainStatus": "0",
-            "MemoryCurrent": "[not set]",
-            "TasksCurrent": "[not set]",
-            "Environment": ("CUDA_CACHE_PATH=%t/voice-harness-llm/cuda-cache"),
-            "ExecStart": (
-                f"{{ path=/usr/sbin/llama-server ; argv[]={command} ; "
-                "ignore_errors=no ; }}"
-            ),
-        }
-        shown = "\n".join(f"{key}={value}" for key, value in properties.items())
-        completed = [
-            subprocess.CompletedProcess([], 0, unit, ""),
-            subprocess.CompletedProcess([], 0, shown, ""),
-        ]
-
-        with (
-            mock.patch.object(
-                service_units.subprocess, "run", side_effect=completed
-            ) as run,
-            mock.patch("builtins.print"),
-        ):
-            result = service_units.audit_installed([name])
-
-        self.assertEqual(result, 0)
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(
-            run.call_args_list[0].args[0],
-            ["systemctl", "--user", "cat", name],
-        )
-        self.assertEqual(
-            run.call_args_list[1].args[0][:4],
-            ["systemctl", "--user", "show", name],
-        )
-        self.assertIn("--property=EnvironmentFiles", run.call_args_list[1].args[0])
-
-    def test_installed_audit_treats_healthy_restart_history_as_observational(
-        self,
-    ) -> None:
-        name = "voice-harness-llm.service"
-        completed = self.audit_fixture(
-            name,
-            service_units.REQUIRED_ENVIRONMENT[name],
-            property_overrides={
-                "ActiveState": "active",
-                "SubState": "running",
-                "NRestarts": "5",
-            },
-        )
-        with (
-            mock.patch.object(service_units.subprocess, "run", side_effect=completed),
-            mock.patch("builtins.print"),
-        ):
-            result = service_units.audit_installed([name])
-
-        self.assertEqual(result, 0)
-
-    def test_installed_audit_rejects_active_restart_loop(self) -> None:
-        name = "voice-harness-llm.service"
-        completed = self.audit_fixture(
-            name,
-            service_units.REQUIRED_ENVIRONMENT[name],
-            property_overrides={
-                "ActiveState": "activating",
-                "SubState": "auto-restart",
-                "NRestarts": "5",
-            },
-        )
-        with (
-            mock.patch.object(service_units.subprocess, "run", side_effect=completed),
-            mock.patch("builtins.print") as output,
-        ):
-            result = service_units.audit_installed([name])
-
-        self.assertEqual(result, 1)
-        self.assertIn("active crash loop", " ".join(map(str, output.call_args_list)))
-
-    def audit_fixture(
-        self,
-        name: str,
-        environment: dict[str, str],
-        *,
-        unit_suffix: str = "",
-        property_overrides: dict[str, str] | None = None,
-    ) -> list[subprocess.CompletedProcess[str]]:
-        unit = (
-            service_units.PROJECT_ROOT / service_units.SOURCE_RELATIVE / name
-        ).read_text()
-        command = service_units._expanded_unit_value(
-            service_units.EXPECTED_EXECSTART[name]
-        )
-        properties = {
-            **service_units._audit_expected_properties(name),
-            "ActiveState": "inactive",
-            "SubState": "dead",
-            "Result": "success",
-            "NRestarts": "0",
-            "ExecMainStatus": "0",
-            "MemoryCurrent": "[not set]",
-            "TasksCurrent": "[not set]",
-            "Environment": " ".join(
-                f"{key}={value}" for key, value in environment.items()
-            ),
-            "ExecStart": (
-                f"{{ path={command.split()[0]} ; argv[]={command} ; "
-                "ignore_errors=no ; }}"
-            ),
-            **(property_overrides or {}),
-        }
-        shown = "\n".join(f"{key}={value}" for key, value in properties.items())
-        return [
-            subprocess.CompletedProcess([], 0, unit + unit_suffix, ""),
-            subprocess.CompletedProcess([], 0, shown, ""),
-        ]
-
-    def test_installed_audit_rejects_environment_files_for_every_service(
-        self,
-    ) -> None:
-        for name in service_units.SERVICE_FILES:
-            with self.subTest(service=name):
-                completed = self.audit_fixture(
-                    name,
-                    service_units.REQUIRED_ENVIRONMENT[name],
-                    unit_suffix=(
-                        "\n# drop-in\n[Service]\n"
-                        "EnvironmentFile=-%h/.config/unsafe.env\n"
-                    ),
-                    property_overrides={
-                        "EnvironmentFiles": "/home/test/.config/unsafe.env"
-                    },
-                )
-                with (
-                    mock.patch.object(
-                        service_units.subprocess, "run", side_effect=completed
-                    ),
-                    mock.patch("builtins.print") as output,
-                ):
-                    result = service_units.audit_installed([name])
-
-                self.assertEqual(result, 1)
-                messages = [str(call) for call in output.call_args_list]
-                self.assertTrue(
-                    any("EnvironmentFile must be empty" in item for item in messages)
-                )
-                self.assertTrue(any("EnvironmentFiles" in item for item in messages))
-
-    def test_installed_audit_rejects_user_choices_owned_by_config_toml(self) -> None:
-        name = "voice-harness-wake.service"
-        environment = {
-            **service_units.REQUIRED_ENVIRONMENT[name],
-            "VOICE_HARNESS_SOURCE": "voice_harness_aec",
-            "VOICE_HARNESS_VOICE": "/home/test/reference.wav",
-            "VOICE_HARNESS_WAKE_THRESHOLD": "0.6",
-            "VOICE_HARNESS_MIN_SPEECH_RMS": "1000",
-            "VOICE_HARNESS_BARGE_IN_MODE": "vad",
-            "VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES": "3",
-            "VOICE_HARNESS_PLAYBACK_QUIET_FRAMES": "2",
-            "VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS": "1.5",
-            "VOICE_HARNESS_PLAYBACK_LATENCY": "100ms",
-            "VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS": "5",
-            "VOICE_HARNESS_HERDR_BIN": "/home/test/.local/bin/herdr",
-            "VOICE_HARNESS_PROJECT_ROOT": "/home/test/projects",
-            "VOICE_HARNESS_GITHUB_ROOT": "/home/test/projects/forks",
-            "DICTATION_INJECT": "paste",
-            "DICTATION_REPLACEMENTS": "cursor=Cursor",
-        }
-        completed = self.audit_fixture(name, environment)
-
-        with (
-            mock.patch.object(service_units.subprocess, "run", side_effect=completed),
-            mock.patch("builtins.print"),
-        ):
-            result = service_units.audit_installed([name])
-
-        self.assertEqual(result, 1)
-
-    def test_installed_audit_rejects_unknown_and_protected_wake_overrides(
-        self,
-    ) -> None:
-        name = "voice-harness-wake.service"
-        environment = {
-            **service_units.REQUIRED_ENVIRONMENT[name],
-            "LD_PRELOAD": "/tmp/inject.so",
-            "DICTATION_SOCKET": "/tmp/dictation.sock",
-            "CUDA_CACHE_PATH": "/tmp/cuda",
-            "XDG_RUNTIME_DIR": "/tmp/runtime",
-            "VOICE_HARNESS_LLM_HOST": "0.0.0.0",
-        }
-        completed = self.audit_fixture(name, environment)
-
-        with (
-            mock.patch.object(service_units.subprocess, "run", side_effect=completed),
-            mock.patch("builtins.print") as output,
-        ):
-            result = service_units.audit_installed([name])
-
-        self.assertEqual(result, 1)
-        messages = " ".join(str(call) for call in output.call_args_list)
-        for variable in environment.keys() - service_units.REQUIRED_ENVIRONMENT[name]:
-            self.assertIn(variable, messages)
-
-    def test_installed_audit_rejects_changed_required_environment(self) -> None:
-        cases = {
-            "dictation.service": ("DICTATION_SOCKET", "/tmp/dictation.sock"),
-            "voice-harness-llm.service": ("CUDA_CACHE_PATH", "/tmp/llm-cache"),
-            "voice-harness-tts.service": ("CUDA_CACHE_PATH", "/tmp/tts-cache"),
-            "voice-harness-wake.service": ("PYTHONUNBUFFERED", "0"),
-        }
-        for name, (variable, value) in cases.items():
-            with self.subTest(service=name, variable=variable):
-                environment = {
-                    **service_units.REQUIRED_ENVIRONMENT[name],
-                    variable: value,
-                }
-                completed = self.audit_fixture(name, environment)
-                with (
-                    mock.patch.object(
-                        service_units.subprocess, "run", side_effect=completed
-                    ),
-                    mock.patch("builtins.print") as output,
-                ):
-                    result = service_units.audit_installed([name])
-
-                self.assertEqual(result, 1)
-                self.assertIn(
-                    variable, " ".join(str(call) for call in output.call_args_list)
-                )
-
-    def test_installed_audit_validates_security_relevant_wake_values(self) -> None:
-        name = "voice-harness-wake.service"
-        environment = {
-            **service_units.REQUIRED_ENVIRONMENT[name],
-            "VOICE_HARNESS_VOICE": "relative.wav",
-            "VOICE_HARNESS_WAKE_THRESHOLD": "2",
-            "VOICE_HARNESS_BARGE_IN_MODE": "always",
-            "VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES": "0",
-            "VOICE_HARNESS_PROJECT_ROOT": "/home/test/projects",
-            "VOICE_HARNESS_GITHUB_ROOT": "/home/test/projects/../outside",
-        }
-        completed = self.audit_fixture(name, environment)
-
-        with (
-            mock.patch.object(service_units.subprocess, "run", side_effect=completed),
-            mock.patch("builtins.print") as output,
-        ):
-            result = service_units.audit_installed([name])
-
-        self.assertEqual(result, 1)
-        messages = " ".join(str(call) for call in output.call_args_list)
-        for variable in environment.keys() - service_units.REQUIRED_ENVIRONMENT[name]:
-            self.assertIn(variable, messages)
-
-    def test_installed_audit_rejects_effective_weakening_override(self) -> None:
-        name = "voice-harness-llm.service"
-        source_unit = (
-            service_units.PROJECT_ROOT / service_units.SOURCE_RELATIVE / name
-        ).read_text()
-        weakened_command = service_units._expanded_unit_value(
-            service_units.EXPECTED_EXECSTART[name]
-        ).replace("--host 127.0.0.1", "--host 0.0.0.0")
-        unit = (
-            source_unit + "\n# weakening drop-in\n[Service]\n"
-            "NoNewPrivileges=false\n"
-            "MemoryMax=infinity\n"
-            "ExecStart=\n"
-            f"ExecStart={weakened_command}\n"
-        )
-        properties = {
-            **service_units._audit_expected_properties(name),
-            "ActiveState": "active",
-            "SubState": "running",
-            "Result": "success",
-            "NRestarts": "0",
-            "ExecMainStatus": "0",
-            "MemoryCurrent": "1",
-            "TasksCurrent": "1",
-            "Environment": ("CUDA_CACHE_PATH=%t/voice-harness-llm/cuda-cache"),
-            "MemoryMax": "infinity",
-            "NoNewPrivileges": "no",
-            "ExecStart": (
-                f"{{ path=/usr/sbin/llama-server ; argv[]={weakened_command} ; "
-                "ignore_errors=no ; }}"
-            ),
-        }
-        shown = "\n".join(f"{key}={value}" for key, value in properties.items())
-        completed = [
-            subprocess.CompletedProcess([], 0, unit, ""),
-            subprocess.CompletedProcess([], 0, shown, ""),
-        ]
-
-        with (
-            mock.patch.object(service_units.subprocess, "run", side_effect=completed),
-            mock.patch("builtins.print") as output,
-        ):
-            result = service_units.audit_installed([name])
-
-        self.assertEqual(result, 1)
-        messages = [str(call) for call in output.call_args_list]
-        self.assertTrue(any("MemoryMax" in message for message in messages))
-        self.assertTrue(any("NoNewPrivileges" in message for message in messages))
-        self.assertTrue(any("ExecStart" in message for message in messages))
+                assert result is not None
+                self.assertIs(result.process, completed)
+                self.assertEqual(result.context, "staged-system")
+                self.assertEqual(result.rooted_user_context, "unsupported")
+                self.assertEqual(result.reason, reason)
+                self.assertEqual(run.call_args_list[0].args[0][1], "--user")
+                self.assertTrue(run.call_args_list[1].args[0][1].startswith("--root="))
 
     @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze unavailable")
-    def test_systemd_analyze_rejects_genuine_unit_syntax_failure(self) -> None:
+    def test_shipped_unit_passes_staged_verification(self) -> None:
+        result = service_units.systemd_analyze([SHIPPED_UNIT])
+
+        assert result is not None
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze unavailable")
+    def test_rejects_genuine_unit_syntax_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             invalid = Path(temporary) / "invalid.service"
             invalid.write_text(
@@ -861,7 +490,6 @@ class ServiceUnitValidationTests(unittest.TestCase):
 
             result = service_units.systemd_analyze([invalid])
 
-        self.assertIsNotNone(result)
         assert result is not None
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(
@@ -869,7 +497,7 @@ class ServiceUnitValidationTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze unavailable")
-    def test_systemd_analyze_rejects_unknown_required_dependency(self) -> None:
+    def test_rejects_unknown_required_dependency(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             invalid = Path(temporary) / "invalid-dependency.service"
             invalid.write_text(
@@ -883,10 +511,340 @@ class ServiceUnitValidationTests(unittest.TestCase):
 
             result = service_units.systemd_analyze([invalid])
 
-        self.assertIsNotNone(result)
         assert result is not None
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("misspelled-runtime.service", result.stderr)
+
+
+class MainTests(unittest.TestCase):
+    def run_main(self, arguments: list[str]) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = service_units.main(arguments)
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def test_validation_errors_fail_before_systemd_analyze(self) -> None:
+        with (
+            mock.patch.object(service_units, "parity_errors", return_value=["bad"]),
+            mock.patch.object(service_units, "systemd_analyze") as analyze,
+        ):
+            result, _stdout, stderr = self.run_main(["--require-systemd-analyze"])
+
+        self.assertEqual(result, 1)
+        self.assertIn("error: bad", stderr)
+        analyze.assert_not_called()
+
+    def test_missing_systemd_analyze_fails_only_when_required(self) -> None:
+        with mock.patch.object(service_units, "systemd_analyze", return_value=None):
+            optional = self.run_main([])
+            required = self.run_main(["--require-systemd-analyze"])
+
+        self.assertEqual(optional[0], 0)
+        self.assertIn("skipped", optional[1])
+        self.assertEqual(required[0], 1)
+        self.assertIn("systemd-analyze is unavailable", required[2])
+
+    def test_require_user_context_fails_on_honest_unsupported_result(self) -> None:
+        verification = service_units.StagedVerification(
+            subprocess.CompletedProcess([], 0, "", ""),
+            context="staged-system",
+            rooted_user_context="unsupported",
+            reason="Invalid argument",
+        )
+        with mock.patch.object(
+            service_units, "systemd_analyze", return_value=verification
+        ):
+            result, stdout, stderr = self.run_main(
+                ["--require-systemd-analyze", "--require-user-context"]
+            )
+
+        self.assertEqual(result, 1)
+        self.assertIn('"context": "staged-system"', stdout)
+        self.assertIn("user-context verification is unsupported", stderr)
+
+    def test_verification_failure_is_reported(self) -> None:
+        verification = service_units.StagedVerification(
+            subprocess.CompletedProcess([], 1, "", "Command is not executable"),
+            context="staged-user",
+            rooted_user_context="supported",
+        )
+        with mock.patch.object(
+            service_units, "systemd_analyze", return_value=verification
+        ):
+            result, _stdout, stderr = self.run_main(["--require-systemd-analyze"])
+
+        self.assertEqual(result, 1)
+        self.assertIn("Command is not executable", stderr)
+
+    def test_audit_installed_flag_delegates_to_the_read_only_audit(self) -> None:
+        with mock.patch.object(
+            service_units, "audit_installed", return_value=1
+        ) as audit:
+            result, _stdout, _stderr = self.run_main(["--audit-installed"])
+
+        self.assertEqual(result, 1)
+        audit.assert_called_once_with()
+
+
+class InstalledAuditTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        home = Path(temporary.name) / "home"
+        runtime = Path(temporary.name) / "runtime"
+        home.mkdir()
+        runtime.mkdir()
+        environment = mock.patch.dict(
+            os.environ, {"HOME": str(home), "XDG_RUNTIME_DIR": str(runtime)}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.server = Path(
+            service_units._expanded_unit_value(service_units.EXPECTED_EXECSTART)
+        )
+        self.server.parent.mkdir(parents=True)
+        self.server.write_text("#!/bin/sh\n")
+        self.server.chmod(0o755)
+
+    def fixture(
+        self,
+        *,
+        environment: dict[str, str] | None = None,
+        unit_suffix: str = "",
+        property_overrides: dict[str, str] | None = None,
+        omit: tuple[str, ...] = (),
+    ) -> list[subprocess.CompletedProcess[str]]:
+        assignments = (
+            service_units.REQUIRED_ENVIRONMENT if environment is None else environment
+        )
+        properties = {
+            **service_units._audit_expected_properties(),
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+            "NRestarts": "0",
+            "ExecMainStatus": "0",
+            "MemoryCurrent": "[not set]",
+            "TasksCurrent": "[not set]",
+            "Environment": " ".join(
+                f"{key}={service_units._expanded_unit_value(value)}"
+                for key, value in assignments.items()
+            ),
+            "ExecStart": (
+                f"{{ path={self.server} ; argv[]={self.server} ; ignore_errors=no ; "
+                "start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; "
+                "status=0/0 }"
+            ),
+            **(property_overrides or {}),
+        }
+        shown = "\n".join(
+            f"{key}={value}" for key, value in properties.items() if key not in omit
+        )
+        return [
+            subprocess.CompletedProcess(
+                [], 0, SHIPPED_UNIT.read_text() + unit_suffix, ""
+            ),
+            subprocess.CompletedProcess([], 0, shown, ""),
+        ]
+
+    def audit(
+        self, completed: list[subprocess.CompletedProcess[str]]
+    ) -> tuple[int, str, str, mock.MagicMock]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(
+                platform_services.subprocess, "run", side_effect=completed
+            ) as run,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = service_units.audit_installed(config=default_user_config())
+        return result, stdout.getvalue(), stderr.getvalue(), run
+
+    def test_expected_properties_cover_every_non_observational_property(
+        self,
+    ) -> None:
+        observational = {
+            "ActiveState",
+            "SubState",
+            "Result",
+            "NRestarts",
+            "ExecMainStatus",
+            "MemoryCurrent",
+            "TasksCurrent",
+            "Environment",
+            "ExecStart",
+        }
+        self.assertEqual(
+            set(service_units._audit_expected_properties()),
+            set(service_units.AUDIT_SHOW_PROPERTIES) - observational,
+        )
+
+    def test_reads_effective_unit_and_runtime_state(self) -> None:
+        result, stdout, stderr, run = self.audit(self.fixture())
+
+        self.assertEqual(result, 0, stderr)
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            ["systemctl", "--user", "cat", SERVICE_NAME],
+        )
+        show = run.call_args_list[1].args[0]
+        self.assertEqual(show[:4], ["systemctl", "--user", "show", SERVICE_NAME])
+        self.assertIn("--property=EnvironmentFiles", show)
+        self.assertIn(f"{SERVICE_NAME}: active=inactive sub=dead", stdout)
+        self.assertIn(
+            "configuration: device=auto backend=parakeet "
+            "model=nemo-parakeet-tdt-0.6b-v2",
+            stdout,
+        )
+
+    def test_empty_properties_that_systemd_leaves_out_count_as_empty(self) -> None:
+        result, _stdout, stderr, _run = self.audit(
+            self.fixture(omit=("EnvironmentFiles", "InaccessiblePaths"))
+        )
+
+        self.assertEqual(result, 0, stderr)
+
+    def test_missing_required_property_still_fails(self) -> None:
+        result, _stdout, stderr, _run = self.audit(
+            self.fixture(omit=("ProtectSystem",))
+        )
+
+        self.assertEqual(result, 1)
+        self.assertIn("effective ProtectSystem must be 'strict', got None", stderr)
+
+    def test_unit_that_is_not_installed_fails_without_reading_properties(
+        self,
+    ) -> None:
+        missing = subprocess.CompletedProcess(
+            [], 1, "", f"No files found for {SERVICE_NAME}."
+        )
+        result, _stdout, stderr, run = self.audit([missing])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("systemctl cat failed: No files found", stderr)
+
+    def test_reports_a_missing_service_environment(self) -> None:
+        self.server.unlink()
+
+        result, _stdout, stderr, _run = self.audit(self.fixture())
+
+        self.assertEqual(result, 1)
+        self.assertIn("missing or not executable", stderr)
+        self.assertIn("scripts/install.sh", stderr)
+
+    def test_healthy_restart_history_is_observational(self) -> None:
+        result, _stdout, stderr, _run = self.audit(
+            self.fixture(
+                property_overrides={
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "NRestarts": "5",
+                }
+            )
+        )
+
+        self.assertEqual(result, 0, stderr)
+
+    def test_rejects_active_restart_loop_and_failed_state(self) -> None:
+        for overrides, message in (
+            (
+                {"ActiveState": "activating", "SubState": "auto-restart"},
+                "active crash loop",
+            ),
+            ({"ActiveState": "failed", "Result": "exit-code"}, "unhealthy state"),
+        ):
+            with self.subTest(message=message):
+                result, _stdout, stderr, _run = self.audit(
+                    self.fixture(property_overrides={**overrides, "NRestarts": "5"})
+                )
+
+                self.assertEqual(result, 1)
+                self.assertIn(message, stderr)
+
+    def test_rejects_environment_files(self) -> None:
+        result, _stdout, stderr, _run = self.audit(
+            self.fixture(
+                unit_suffix=(
+                    "\n# drop-in\n[Service]\nEnvironmentFile=-%h/.config/unsafe.env\n"
+                ),
+                property_overrides={
+                    "EnvironmentFiles": "/home/test/.config/unsafe.env"
+                },
+            )
+        )
+
+        self.assertEqual(result, 1)
+        self.assertIn("effective EnvironmentFile must be empty", stderr)
+        self.assertIn("effective EnvironmentFiles must be ''", stderr)
+
+    def test_rejects_user_settings_and_process_injection_overrides(self) -> None:
+        overrides = {
+            "LD_PRELOAD": "/tmp/inject.so",
+            "DICTATION_RUNTIME_DIR": "/tmp/runtime",
+            "DICTATION_DEVICE": "cuda",
+            "DICTATION_SOCKET": "/tmp/dictation.sock",
+        }
+        result, _stdout, stderr, _run = self.audit(
+            self.fixture(
+                environment={**service_units.REQUIRED_ENVIRONMENT, **overrides}
+            )
+        )
+
+        self.assertEqual(result, 1)
+        self.assertIn("unsupported keys", stderr)
+        for variable in overrides:
+            self.assertIn(variable, stderr)
+
+    def test_rejects_changed_or_missing_required_environment(self) -> None:
+        for variable in service_units.REQUIRED_ENVIRONMENT:
+            with self.subTest(variable=variable, change="changed"):
+                result, _stdout, stderr, _run = self.audit(
+                    self.fixture(
+                        environment={
+                            **service_units.REQUIRED_ENVIRONMENT,
+                            variable: "/tmp/elsewhere",
+                        }
+                    )
+                )
+                self.assertEqual(result, 1)
+                self.assertIn(f"effective {variable} must be", stderr)
+            with self.subTest(variable=variable, change="missing"):
+                environment = dict(service_units.REQUIRED_ENVIRONMENT)
+                del environment[variable]
+                result, _stdout, stderr, _run = self.audit(
+                    self.fixture(environment=environment)
+                )
+                self.assertEqual(result, 1)
+                self.assertIn(f"lacks required keys ['{variable}']", stderr)
+
+    def test_rejects_effective_weakening_drop_in(self) -> None:
+        weakened = f"+{self.server}"
+        result, _stdout, stderr, _run = self.audit(
+            self.fixture(
+                unit_suffix=(
+                    "\n# weakening drop-in\n[Service]\n"
+                    "NoNewPrivileges=false\nMemoryMax=infinity\nSystemCallFilter=@raw-io\n"
+                    f"ExecStart=\nExecStart={weakened}\n"
+                ),
+                property_overrides={
+                    "MemoryMax": "infinity",
+                    "NoNewPrivileges": "no",
+                    "ExecStart": (
+                        f"{{ path={self.server} ; argv[]=/usr/bin/env {self.server} ; "
+                        "ignore_errors=no ; }"
+                    ),
+                },
+            )
+        )
+
+        self.assertEqual(result, 1)
+        self.assertIn("effective MemoryMax must be '6442450944'", stderr)
+        self.assertIn("effective NoNewPrivileges must be 'yes'", stderr)
+        self.assertIn("effective SystemCallFilter must be empty", stderr)
+        self.assertIn("effective ExecStart must be", stderr)
+        self.assertIn("effective ExecStart argv must be", stderr)
 
 
 if __name__ == "__main__":

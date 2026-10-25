@@ -1,283 +1,303 @@
 from __future__ import annotations
 
-import importlib.metadata
-import re
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
-import tomllib
 import unittest
-from dataclasses import replace
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import cli, llm_launcher, service_manager
-from local_voice_harness.config import START_SERVICES
-from local_voice_harness.install_profile import resolve_installation_plan
-from local_voice_harness.integrations.registry import build_integration_registry
-from local_voice_harness.stt import server as stt_server
-from local_voice_harness.user_config import default_user_config
+from local_dictation import service_manager
+from local_dictation.config import SERVICE_NAME
+from local_dictation.errors import DictationError
+from local_dictation.service_units import packaged_unit_text
+from local_dictation.user_config import default_user_config
+
+SHIPPED = (service_manager.PROJECT_ROOT / "systemd" / "user" / SERVICE_NAME).read_text()
+OK = subprocess.CompletedProcess([], 0, "", "")
 
 
-def _snapshot():
-    config = default_user_config()
-    return service_manager.ServiceManagementSnapshot(
-        config,
-        build_integration_registry(config),
-    )
+class ServiceManagerTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.systemd = Path(temporary.name) / "systemd" / "user"
+        self.destination = self.systemd / SERVICE_NAME
+        directory = mock.patch.object(service_manager, "SYSTEMD_USER_DIR", self.systemd)
+        directory.start()
+        self.addCleanup(directory.stop)
 
-
-class ServiceManagementTests(unittest.TestCase):
-    def test_restart_reuses_one_service_management_snapshot(self) -> None:
-        snapshot = _snapshot()
-        with (
-            mock.patch.object(
-                service_manager.ServiceManagementSnapshot,
-                "load",
-                return_value=snapshot,
-            ) as load,
-            mock.patch.object(service_manager, "systemctl"),
-        ):
-            service_manager.restart_services(include_herdr=False)
-
-        load.assert_called_once_with()
-
-    def test_stop_herdr_uses_configured_snapshot_client(self) -> None:
-        snapshot = _snapshot()
-        client = mock.Mock(executable="/opt/herdr", timeout=17)
-        client.is_running.return_value = True
-        client.run.return_value = subprocess.CompletedProcess([], 0, "", "")
-        configured = replace(
-            snapshot,
-            registry=replace(snapshot.registry, herdr_client=lambda: client),
-        )
-        service_manager.stop_herdr(configured)
-
-        client.run.assert_called_once_with("server", "stop", check=False)
-
-    def test_start_uses_only_always_on_services(self) -> None:
-        with mock.patch.object(service_manager, "systemctl") as systemctl:
-            service_manager.start_services()
-        systemctl.assert_called_once_with("start", *START_SERVICES)
-
-    def test_install_preserves_external_dictation(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            systemd = Path(temporary)
-            dictation = systemd / "dictation.service"
-            dictation.write_text("external dictation\n")
-            with (
-                mock.patch.object(service_manager, "SYSTEMD_USER_DIR", systemd),
-                mock.patch.object(service_manager, "systemctl"),
-                mock.patch("builtins.print") as output,
-            ):
-                service_manager.install_services(force=True)
-            self.assertEqual(dictation.read_text(), "external dictation\n")
-            self.assertIn(
-                "voice-harness-wake",
-                (systemd / "voice-harness-wake.service").read_text(),
-            )
-            self.assertTrue(
-                any(
-                    "--force --replace-dictation" in str(call)
-                    for call in output.call_args_list
-                )
-            )
-
-    def test_install_replaces_dictation_only_with_explicit_migration_flag(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            systemd = Path(temporary)
-            dictation = systemd / "dictation.service"
-            dictation.write_text("external dictation\n")
-            with (
-                mock.patch.object(service_manager, "SYSTEMD_USER_DIR", systemd),
-                mock.patch.object(service_manager, "systemctl"),
-            ):
-                service_manager.install_services(force=True, replace_dictation=True)
-
-            self.assertEqual(
-                dictation.read_text(),
-                service_manager.unit_text("dictation.service"),
-            )
-
-    def test_services_audit_is_read_only_and_exposed_by_cli(self) -> None:
-        parsed = cli.parser().parse_args(["services", "audit"])
-        install = cli.parser().parse_args(
-            ["services", "install", "--force", "--replace-dictation"]
-        )
-        self.assertEqual(parsed.service_command, "audit")
-        self.assertTrue(install.force)
-        self.assertTrue(install.replace_dictation)
-
+    @contextlib.contextmanager
+    def systemctl(
+        self, *results: subprocess.CompletedProcess[str]
+    ) -> Iterator[mock.MagicMock]:
+        responses = iter(results)
         with mock.patch.object(
-            service_manager, "audit_installed", return_value=0
-        ) as audit_installed:
-            self.assertEqual(service_manager.audit_services(), 0)
-        audit_installed.assert_called_once_with(config=mock.ANY)
-        with (
-            mock.patch.object(cli, "audit_services", return_value=0) as audit,
-            self.assertRaises(SystemExit) as exited,
-        ):
-            cli.dispatch(parsed)
-        audit.assert_called_once_with()
-        self.assertEqual(exited.exception.code, 0)
+            service_manager,
+            "systemctl",
+            side_effect=lambda *_arguments, check=True: next(responses, OK),
+        ) as systemctl:
+            yield systemctl
 
-    def test_hardening_docs_require_dictation_replacement_and_audit(self) -> None:
-        root = service_manager.PROJECT_ROOT
-        hardening = (root / "docs/service-hardening.md").read_text()
-        installation = (root / "docs/installation.md").read_text()
+    def calls(self, systemctl: mock.MagicMock) -> list[tuple[str, ...]]:
+        return [call.args for call in systemctl.call_args_list]
 
-        for text in (hardening, installation):
-            self.assertIn(
-                "voice-harness services install --force --replace-dictation",
-                text,
-            )
-            self.assertIn("voice-harness services audit", text)
-        self.assertIn("intentionally replaces the standalone unit", installation)
+    def output(self, action: Callable[[], object]) -> str:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            action()
+        return stdout.getvalue()
 
-    def test_packaged_systemd_resources_are_available(self) -> None:
+
+class UnitTextTests(ServiceManagerTestCase):
+    def test_checkout_and_packaged_copies_are_identical(self) -> None:
+        self.assertEqual(service_manager.unit_text(), SHIPPED)
+        self.assertEqual(packaged_unit_text(), SHIPPED)
+
+    def test_falls_back_to_the_packaged_copy_outside_a_checkout(self) -> None:
         with mock.patch.object(
-            service_manager, "PROJECT_ROOT", Path("/definitely/not/a/source/tree")
+            service_manager, "PROJECT_ROOT", Path("/definitely/not/a/checkout")
         ):
-            text = service_manager.unit_text("voice-harness-wake.service")
-        self.assertIn("voice-harness-wake", text)
+            self.assertEqual(service_manager.unit_text(), packaged_unit_text())
 
-    def test_source_units_match_packaged_resources(self) -> None:
-        source_root = service_manager.PROJECT_ROOT / "systemd" / "user"
-        for source in source_root.glob("*.service"):
+
+class InstallTests(ServiceManagerTestCase):
+    def test_installs_reloads_and_enables_only_this_unit(self) -> None:
+        with self.systemctl() as systemctl:
+            output = self.output(service_manager.install_service)
+
+        self.assertEqual(self.destination.read_text(), SHIPPED)
+        self.assertEqual(
+            self.calls(systemctl), [("daemon-reload",), ("enable", SERVICE_NAME)]
+        )
+        self.assertIn("dictate services start", output)
+        self.assertNotIn("disable --now", output)
+
+    def test_identical_unit_is_left_in_place_but_still_enabled(self) -> None:
+        self.systemd.mkdir(parents=True)
+        self.destination.write_text(SHIPPED)
+        before = self.destination.stat()
+
+        with self.systemctl() as systemctl:
+            output = self.output(service_manager.install_service)
+
+        after = self.destination.stat()
+        self.assertEqual(
+            (before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns)
+        )
+        self.assertIn("already up to date", output)
+        self.assertEqual(
+            self.calls(systemctl), [("daemon-reload",), ("enable", SERVICE_NAME)]
+        )
+
+    def test_differing_unit_requires_force(self) -> None:
+        self.systemd.mkdir(parents=True)
+        self.destination.write_text("[Service]\nExecStart=/custom\n")
+
+        with (
+            self.systemctl() as systemctl,
+            self.assertRaisesRegex(DictationError, "dictate services install --force"),
+        ):
+            service_manager.install_service()
+
+        self.assertEqual(self.destination.read_text(), "[Service]\nExecStart=/custom\n")
+        systemctl.assert_not_called()
+
+        with self.systemctl():
+            output = self.output(lambda: service_manager.install_service(force=True))
+
+        self.assertEqual(self.destination.read_text(), SHIPPED)
+        self.assertIn("Replaced", output)
+
+    def test_force_replaces_a_symlink_without_touching_its_target(self) -> None:
+        self.systemd.mkdir(parents=True)
+        target = self.systemd.parent / "elsewhere.service"
+        target.write_text("[Service]\nExecStart=/custom\n")
+        self.destination.symlink_to(target)
+
+        with self.assertRaises(DictationError), self.systemctl():
+            service_manager.install_service()
+        with self.systemctl():
+            self.output(lambda: service_manager.install_service(force=True))
+
+        self.assertFalse(self.destination.is_symlink())
+        self.assertEqual(self.destination.read_text(), SHIPPED)
+        self.assertEqual(target.read_text(), "[Service]\nExecStart=/custom\n")
+
+    def test_refuses_to_replace_a_directory_even_with_force(self) -> None:
+        self.destination.mkdir(parents=True)
+        (self.destination / "keep").write_text("data")
+
+        for force in (False, True):
             with (
-                self.subTest(unit=source.name),
-                mock.patch.object(
-                    service_manager,
-                    "PROJECT_ROOT",
-                    Path("/definitely/not/a/source/tree"),
-                ),
+                self.subTest(force=force),
+                self.systemctl() as systemctl,
+                self.assertRaisesRegex(DictationError, "refusing to replace directory"),
             ):
-                self.assertEqual(
-                    source.read_text(), service_manager.unit_text(source.name)
-                )
+                service_manager.install_service(force=force)
+            systemctl.assert_not_called()
 
-    def test_llm_unit_defers_model_and_device_to_typed_launcher(self) -> None:
-        project_root = service_manager.PROJECT_ROOT
-        unit = (project_root / "systemd/user/voice-harness-llm.service").read_text()
-        installation = (project_root / "docs/installation.md").read_text()
-        snapshot = default_user_config()
-        configured = replace(
-            snapshot,
-            providers=replace(
-                snapshot.providers,
-                llm_provider="local",
-                llm_model="configured-model",
+        self.assertEqual((self.destination / "keep").read_text(), "data")
+
+    def test_leaves_legacy_and_other_units_alone(self) -> None:
+        self.systemd.mkdir(parents=True)
+        legacy = self.systemd / "dictation.service"
+        legacy.write_text("legacy dictation\n")
+        other = self.systemd / "other.service"
+        other.write_text("other\n")
+
+        with self.systemctl() as systemctl:
+            installed = self.output(lambda: service_manager.install_service(force=True))
+            self.output(service_manager.uninstall_service)
+
+        self.assertIn(f"Left {legacy} as it is", installed)
+        self.assertIn("systemctl --user disable --now dictation.service", installed)
+        self.assertEqual(legacy.read_text(), "legacy dictation\n")
+        self.assertEqual(other.read_text(), "other\n")
+        for arguments in self.calls(systemctl):
+            self.assertTrue(set(arguments[1:]) <= {SERVICE_NAME}, arguments)
+
+    def test_systemctl_failure_is_reported_with_its_message(self) -> None:
+        failed = subprocess.CompletedProcess(
+            [], 1, "", "Failed to connect to bus: No medium found\n"
+        )
+        with (
+            self.systemctl(failed),
+            self.assertRaisesRegex(
+                DictationError,
+                "systemctl --user daemon-reload failed: Failed to connect to bus",
             ),
-            compute=replace(snapshot.compute, cuda_device="CUDA7"),
-        )
-        with mock.patch.object(
-            llm_launcher, "load_user_config", return_value=configured
         ):
-            command = llm_launcher.command(cuda_available=True)
+            self.output(service_manager.install_service)
 
-        self.assertNotIn("--model", unit)
-        self.assertNotIn("--device", unit)
-        self.assertIn("voice-harness-llm", unit)
-        self.assertEqual(command[command.index("--alias") + 1], "configured-model")
-        self.assertEqual(command[command.index("--device") + 1], "CUDA7")
+
+class LifecycleTests(ServiceManagerTestCase):
+    def test_start_stop_and_restart_target_only_this_unit(self) -> None:
+        for action, verb in (
+            (service_manager.start_service, "start"),
+            (service_manager.stop_service, "stop"),
+            (service_manager.restart_service, "restart"),
+        ):
+            with self.subTest(verb=verb), self.systemctl() as systemctl:
+                output = self.output(action)
+
+                self.assertEqual(self.calls(systemctl), [(verb, SERVICE_NAME)])
+                self.assertIn(SERVICE_NAME, output)
+
+    def test_lifecycle_failures_raise_with_the_systemctl_message(self) -> None:
+        missing = subprocess.CompletedProcess(
+            [], 5, "", f"Failed to start {SERVICE_NAME}: Unit not found.\n"
+        )
+        with (
+            self.systemctl(missing),
+            self.assertRaisesRegex(DictationError, "Unit not found"),
+        ):
+            service_manager.start_service()
+
+    def test_status_reports_active_and_enabled_state(self) -> None:
+        with self.systemctl(
+            subprocess.CompletedProcess([], 0, "active\n", ""),
+            subprocess.CompletedProcess([], 0, "enabled\n", ""),
+        ) as systemctl:
+            output = self.output(service_manager.status)
+
+        self.assertEqual(output, f"{SERVICE_NAME}: active (enabled)\n")
         self.assertEqual(
-            set(re.findall(r"Qwen3\.5-[A-Za-z0-9_.-]+\.gguf", installation)),
-            {llm_launcher.MODEL_FILE.name},
+            self.calls(systemctl),
+            [("is-active", SERVICE_NAME), ("is-enabled", SERVICE_NAME)],
         )
 
-    def test_dictation_defaults_have_documented_installable_backends(self) -> None:
-        project_root = service_manager.PROJECT_ROOT
-        unit = (project_root / "systemd/user/dictation.service").read_text()
-        configuration = (project_root / "docs/configuration.md").read_text()
-        installer = (project_root / "scripts/install.sh").read_text()
-        metadata = tomllib.loads((project_root / "pyproject.toml").read_text())
-        extras = metadata["project"]["optional-dependencies"]
+    def test_status_of_a_unit_that_is_not_installed(self) -> None:
+        with self.systemctl(
+            subprocess.CompletedProcess([], 4, "inactive\n", ""),
+            subprocess.CompletedProcess([], 4, "", "Failed to get unit file state"),
+        ):
+            output = self.output(service_manager.status)
 
-        self.assertNotIn("Environment=DICTATION_BACKEND", unit)
-        self.assertNotIn("Environment=DICTATION_MODEL", unit)
-        defaults = default_user_config()
-        self.assertEqual(defaults.compute.dictation_backend, "parakeet")
+        self.assertEqual(output, f"{SERVICE_NAME}: inactive (not-found)\n")
+
+    def test_audit_passes_the_loaded_configuration(self) -> None:
+        config = default_user_config()
+        with (
+            mock.patch.object(service_manager, "load_user_config", return_value=config),
+            mock.patch.object(
+                service_manager, "audit_installed", return_value=1
+            ) as audit,
+        ):
+            self.assertEqual(service_manager.audit_service(), 1)
+
+        audit.assert_called_once_with(config=config)
+
+    def test_logs_reads_this_units_journal_and_exits_with_its_status(self) -> None:
+        for follow, expected in (
+            (False, ["journalctl", "--user", "-u", SERVICE_NAME, "-n", "40"]),
+            (True, ["journalctl", "--user", "-u", SERVICE_NAME, "-n", "40", "-f"]),
+        ):
+            with (
+                self.subTest(follow=follow),
+                mock.patch.object(
+                    service_manager.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 3),
+                ) as run,
+                self.assertRaises(SystemExit) as exited,
+            ):
+                service_manager.logs(follow=follow, lines=40)
+
+            run.assert_called_once_with(expected, check=False)
+            self.assertEqual(exited.exception.code, 3)
+
+
+class UninstallTests(ServiceManagerTestCase):
+    def test_stops_disables_and_removes_the_shipped_unit(self) -> None:
+        self.systemd.mkdir(parents=True)
+        self.destination.write_text(SHIPPED)
+
+        with self.systemctl() as systemctl:
+            output = self.output(service_manager.uninstall_service)
+
+        self.assertFalse(self.destination.exists())
+        self.assertIn("Removed", output)
         self.assertEqual(
-            defaults.compute.dictation_model, stt_server.PARAKEET_DEFAULT_MODEL
-        )
-        self.assertIn(stt_server.PARAKEET_DEFAULT_MODEL, configuration)
-        self.assertTrue(
-            any(dependency.startswith("onnx-asr") for dependency in extras["dictation"])
-        )
-        self.assertTrue(
-            any(
-                dependency.startswith("onnx-asr")
-                for dependency in extras["dictation-cuda"]
-            )
-        )
-        self.assertIn('--extra "$INSTALL_DICTATION_EXTRA"', installer)
-        self.assertEqual(
-            resolve_installation_plan(profile="local-cuda").dictation_extra,
-            "dictation-cuda",
-        )
-        self.assertTrue(
-            any(
-                dependency.startswith("onnxruntime")
-                for dependency in extras["dictation"]
-            )
-        )
-        self.assertFalse(
-            any(
-                "gpu" in dependency.casefold() or "nvidia" in dependency.casefold()
-                for dependency in extras["dictation"]
-            )
-        )
-        self.assertTrue(
-            any(
-                dependency.startswith("faster-whisper")
-                for dependency in extras["dictation-whisper"]
-            )
+            self.calls(systemctl),
+            [("stop", SERVICE_NAME), ("disable", SERVICE_NAME), ("daemon-reload",)],
         )
 
-    def test_all_console_entry_points_load(self) -> None:
-        expected = {
-            "voice-harness",
-            "voice-harness-dictate",
-            "voice-harness-wake",
-            "voice-harness-dictation",
-            "voice-harness-llm",
-            "voice-harness-tts",
-            "voice-harness-cursor-worker",
-        }
-        scripts = {
-            entry.name: entry
-            for entry in importlib.metadata.distribution(
-                "local-voice-harness"
-            ).entry_points
-            if entry.group == "console_scripts"
-        }
-        self.assertEqual(set(scripts), expected)
-        for entry in scripts.values():
-            self.assertTrue(callable(entry.load()))
+    def test_keeps_a_customized_unit(self) -> None:
+        self.systemd.mkdir(parents=True)
+        self.destination.write_text("[Service]\nExecStart=/custom\n")
 
-    def test_console_entry_points_smoke(self) -> None:
-        scripts = Path(sys.executable).parent
-        commands = {
-            "voice-harness": ["--help"],
-            "voice-harness-dictate": ["--help"],
-            "voice-harness-wake": ["--check"],
-            "voice-harness-dictation": ["--check"],
-            "voice-harness-llm": ["--check"],
-            "voice-harness-tts": ["--check"],
-            "voice-harness-cursor-worker": ["--help"],
-        }
-        for name, arguments in commands.items():
-            with self.subTest(name=name):
-                process = subprocess.run(
-                    [str(scripts / name), *arguments],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                    check=False,
-                )
-                self.assertEqual(process.returncode, 0, process.stderr)
+        with self.systemctl():
+            output = self.output(service_manager.uninstall_service)
+
+        self.assertEqual(self.destination.read_text(), "[Service]\nExecStart=/custom\n")
+        self.assertIn("Kept", output)
+
+    def test_is_idempotent_when_nothing_is_installed(self) -> None:
+        not_loaded = subprocess.CompletedProcess([], 5, "", "Unit not loaded.")
+        with self.systemctl(not_loaded, not_loaded) as systemctl:
+            output = self.output(service_manager.uninstall_service)
+
+        self.assertIn("is not installed", output)
+        self.assertEqual(self.calls(systemctl)[-1], ("daemon-reload",))
+
+
+class ServerEntryPointTests(unittest.TestCase):
+    def test_service_executable_is_installed_and_passes_its_check(self) -> None:
+        server = Path(sys.executable).parent / "local-dictation-server"
+        process = subprocess.run(
+            [str(server), "--check"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(process.stdout, "local-dictation-server: ok\n")
 
 
 if __name__ == "__main__":

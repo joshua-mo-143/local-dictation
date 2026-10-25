@@ -1,195 +1,110 @@
-# Service hardening and local trust policy
+# Service hardening
 
-The shipped units target the documented single-user, 32 GB CUDA workstation. The
-controls below reduce accidental exposure and post-compromise reach while retaining
-the capabilities each service actually uses. They do not make model processes or
-external tools safe to run on a hostile multi-user machine.
+`local-dictation.service` runs the speech model with as much of systemd's
+sandboxing as CUDA and the first model download allow. It's built for a
+single-user workstation: it limits accidental exposure and how far a compromised
+model process can reach. It doesn't make the model safe to run on a machine
+shared with people you don't trust.
 
-## Capability model
+## What the service can reach
 
-| Service | Filesystem and home | Network | Devices/session | Processes and runtime |
-| --- | --- | --- | --- | --- |
-| `dictation` | Reads its project, virtual environment, optional backend config, and request WAVs. Home is read-only except the managed Hugging Face cache. `%t` remains writable to preserve the standalone-compatible `%t/dictation.sock`. | Unix sockets, IPv4/IPv6 for Hugging Face downloads, and netlink for CUDA discovery. | CUDA devices stay visible. The application does not intentionally use PipeWire or desktop APIs, but AF_UNIX and `%t` mean those same-user session endpoints are not an isolation boundary. | The launcher replaces itself with the server. Temporary and CUDA cache files use `%t/dictation`; the compatibility socket remains mode 0600 at `%t/dictation.sock`. |
-| `voice-harness-llm` | Reads `llama-server` and the GGUF under the project. Home is read-only. Its writable CUDA cache is `%t/voice-harness-llm/cuda-cache`. | Unix, IPv4, and netlink only. `llama-server` is required to bind `127.0.0.1:8090`. AF_UNIX still permits connections to accessible same-user session sockets. | NVIDIA devices remain visible; the service does not intentionally use audio or desktop APIs. | No application subprocesses. Its only managed writable runtime directory is mode 0700. |
-| `voice-harness-tts` | Reads both project environments, backend configuration, the offline Hugging Face cache, and an optional reference WAV. Home is read-only; generated audio uses `%t/voice-harness`, the fixed compatibility socket is `%t/voice-harness-tts.sock`, and the CUDA cache is `%t/voice-harness-tts/cuda-cache`. | Unix sockets include the desktop Secret Service for Venice credentials; IPv4/IPv6 permit the optional Venice backend, and netlink permits CUDA discovery. Local Chatterbox keeps Hugging Face explicitly offline. | NVIDIA devices remain visible. PipeWire playback is performed by clients, not this server. | Uses request threads and invokes libsecret's `secret-tool` for Venice credential lookup. Separate mode-0700 `voice-harness` and `voice-harness-tts` runtime directories are preserved across on-demand stops. |
-| `voice-harness-wake` | Reads and writes repositories, worktrees, durable job state in the mode-0700 `StateDirectory=voice-harness`, GitHub/Cursor/Herdr configuration, and user-selected clone destinations. Broad home access is therefore intentional. System paths remain read-only. | Unix sockets, IPv4/IPv6, and netlink support local model services, GitHub/Git/Herdr, DNS, and network inspection by child tools. | PipeWire and desktop/compositor sockets remain usable. Direct devices are hidden because `pw-record`/`pw-play` use PipeWire rather than ALSA. A private `/tmp` is not used because X11 may rely on `/tmp/.X11-unix`. | Starts audio tools, desktop helpers, `gh`, Git, Herdr/systemd commands, and detached job workers. It receives the largest task allowance and shares the mode-0700 voice runtime directory; worker logs remain transient there. |
+| Area | Policy |
+| --- | --- |
+| Files | Everything is read-only (`ProtectSystem=strict`, `ProtectHome=read-only`) except the user runtime directory `%t`, which holds the socket and `%t/local-dictation`, and the Hugging Face cache (`CacheDirectory=huggingface`), so a fresh install can download the model. `/tmp` is private |
+| Network | Unix sockets for `dictate`, IPv4 and IPv6 for model downloads, and netlink for CUDA device discovery. Nothing else (`RestrictAddressFamilies=`) |
+| Devices | All visible, because CUDA needs the NVIDIA device nodes |
+| Privileges | No capabilities, no privilege gain through `execve`, no creating setuid or setgid files, no new namespaces, no realtime scheduling, and native system calls only |
+| Kernel and processes | Kernel tunables, modules, and logs, the clock, the hostname, and control groups are protected, and other users' processes are hidden in `/proc` |
 
-All services use a `0077` umask, an empty capability set, no-new-privileges,
-read-only system paths, kernel/control-group protections, native system-call
-architecture, core-dump suppression, bounded file descriptors, and a five-starts-per-
-minute rate limit. Namespace creation is disabled. GPU services deliberately do not
-use `PrivateDevices`; CUDA requires NVIDIA device nodes. JIT-sensitive
-`MemoryDenyWriteExecute`, broad syscall filters, device allowlists, and IP firewall
-directives are omitted because their compatibility with CUDA, desktop tools, and
-unprivileged user managers is not established.
+The runtime directory `%t/local-dictation` is owner-only (`0700`) and survives
+service restarts (`RuntimeDirectoryPreserve=yes`), so recordings kept for a retry
+aren't lost when the service restarts. Like the rest of `%t`, it's removed when
+you log out. Files the service creates are owner-only (`UMask=0077`).
 
-AF_UNIX is not treated as model-service isolation. The user runtime directory contains
-PipeWire, D-Bus, compositor, notification, Herdr, and other same-UID sockets. Path and
-mode protections narrow accidental file access, but any accessible same-user session
-endpoint remains trusted. Brittle masks are not used because they would block required
-CUDA discovery or the standalone dictation protocol.
+## Resources
 
-No shipped unit permits `EnvironmentFile`; the installed audit checks both the
-effective unit/drop-in text and systemd's `EnvironmentFiles` property. Each unit's
-explicit `Environment=` keys must exactly match the shipped operational values.
-User-selected providers, devices, audio, integrations, worker timing,
-Herdr/repository paths, dictation injection, and replacements belong in validated
-`config.toml`, not in unit drop-ins. Additional environment assignments, including
-process-injection and service-boundary overrides such as `LD_PRELOAD`,
-socket/cache/runtime paths, and LLM host/bind controls, fail the audit.
+- Memory: throttled above 4 GB and stopped above 6 GB (`MemoryHigh=`,
+  `MemoryMax=`). Swap is unlimited, to avoid an unmeasured failure while CUDA
+  starts up. On an out-of-memory kill, systemd stops the whole service
+  (`OOMPolicy=stop`), and `OOMScoreAdjust=200` makes the kernel more likely to
+  pick it than your desktop.
+- At most 512 tasks and 4096 open files.
+- No core dumps (`LimitCORE=0`), so a crash doesn't write process memory, which
+  can hold audio and transcripts, to disk.
+- Restarts 5 seconds after a failure, up to five starts a minute, and gets 15
+  seconds to stop.
 
-Venice credentials are stored in the desktop Secret Service through libsecret's
-`secret-tool`, not in an application file, environment variable, command
-argument, or unit. Storage sends the key over standard input; status and diagnostic output never
-print it. Secret Service protects the key at rest and can lock it with the desktop
-session, but retrieval necessarily places it briefly in process memory and does not
-isolate it from a process already controlling the same unlocked user session.
+These are safety ceilings, not measured minimums.
 
-The memory high/max pairs are 4/6 GB for dictation, 6/8 GB for llama.cpp, 8/10 GB for
-TTS, and 3/4 GB for wake and its workers. The 28 GB aggregate maxima leave room on
-the tested 32 GB host for the desktop, PipeWire, Herdr, and the kernel. `TasksMax` is
-256 for llama.cpp, 512 for each Python model service, and 1024 for the subprocess-
-heavy wake service. These are safety ceilings, not measured minimum requirements.
-Swap remains unlimited to avoid introducing an unmeasured CUDA cold-start failure;
-`OOMPolicy=stop` and `OOMScoreAdjust=200` make the effective OOM behavior explicit.
+## Deliberately left out
 
-## Unauthenticated llama.cpp policy
+`MemoryDenyWriteExecute=`, `SystemCallFilter=`, `IPAddressDeny=`, and device
+restrictions (`PrivateDevices=`, `DevicePolicy=`, `DeviceAllow=`,
+`DeviceDeny=`) aren't used. Device restrictions break CUDA, and the others
+haven't been shown to work with CUDA, ONNX Runtime, and an unprivileged user
+manager. The checks reject them so they don't creep in by accident.
 
-The endpoint is intentionally unauthenticated and bound to IPv4 loopback. Clients in
-the same Unix account are trusted to submit prompts and consume GPU time. A static
-token embedded in every local client and unit would not separate same-user processes
-and would add fragile secret distribution, so none is added.
+## Environment
 
-Loopback is host-local, not UID-scoped: another login account on the same machine may
-also be able to connect. The supported deployment is a trusted single-user
-workstation. Do not use this configuration on a mutually untrusted multi-user host;
-use a Unix-socket credential-checking proxy or another per-user transport there.
+The unit sets only `CUDA_CACHE_PATH`, `HF_HOME`, and `TMPDIR`. The launcher
+forces the same values, along with `HOME`, `XDG_CACHE_HOME`, and
+`XDG_RUNTIME_DIR`, so the service's paths can't be redirected through the
+environment. It loads no `EnvironmentFile=`. Engine, device, and audio choices
+live in `config.toml`, never in the unit.
 
-## Residual risks and host verification
+## How it's enforced
 
-- CUDA, ONNX Runtime, Chatterbox, llama.cpp, NVIDIA driver behavior, and live Venice
-  API behavior cannot be exercised in CI. CUDA cold starts and remote LLM/TTS latency
-  remain pending human host verification.
-- The dictation cache is writable because a clean installation downloads its model.
-  Pre-provisioning a read-only cache would permit a narrower policy.
-- The wake service retains broad same-user authority by design. Its filesystem,
-  desktop, GitHub, Herdr, and worker permissions are not a boundary against untrusted
-  request content. Trusted-request/external-content authorization is handled in a
-  separate stacked change.
-- The full same-user runtime/session remains trusted. AF_UNIX cannot distinguish a
-  legitimate local client from another process running as the same UID.
-- `ProtectProc=invisible`, private device visibility for wake, address-family
-  restrictions, and resource ceilings require real desktop/audio/GPU validation.
+- `python -m local_dictation.service_units`, which runs in CI, checks the shipped
+  unit. Every controlled directive must appear exactly once with the expected
+  value, the left-out directives must be absent, and the environment and
+  `ExecStart=` must match. It also checks that the checkout and wheel ship the
+  same unit, and that the unit agrees with the package and the launcher.
+- When `systemd-analyze` is installed, it also runs `systemd-analyze verify` on
+  the unit in a staged root; `--require-systemd-analyze` makes a missing
+  `systemd-analyze` an error. Some systemd versions can't verify a user unit
+  there, so the check falls back to system context and says so in its output.
+  `--require-user-context` makes that fallback an error.
+- `dictate services audit` checks the installed unit as systemd sees it,
+  including drop-ins. See [Service management](service-management.md#what-the-audit-checks).
 
-## Pending human host-smoke record
+## Residual risks
 
-None of the following checks has been run by CI or during this implementation pass.
-After intentionally installing the candidate units on the target host, record each
-row as `PASS` or `FAIL` with a journal excerpt or observation:
+- Processes running as you are trusted. The socket is owner-only, but any of
+  them can connect to it. The service can write anywhere in your runtime
+  directory, which also holds other programs' sockets, because its own socket
+  lives there.
+- The model cache and network access are open so a fresh install can download
+  the model. Pre-provisioning the cache would allow a narrower policy.
+- CI doesn't exercise CUDA, ONNX Runtime, faster-whisper, or NVIDIA driver
+  behaviour. `ProtectProc=invisible`, the address-family list, and the resource
+  ceilings need checking on real hardware.
 
-| Check | Result | Evidence |
-| --- | --- | --- |
-| Effective installed-unit audit | PENDING | |
-| Denied system/home write probes | PENDING | |
-| Denied address-family probes | PENDING | |
-| Dictation CUDA cold start/cache | PENDING | |
-| llama.cpp CUDA cold start/cache and loopback bind | PENDING | |
-| TTS CUDA cold start/cache and optional reference WAV | PENDING | |
-| PipeWire capture/playback and desktop helpers | PENDING | |
-| GitHub/Herdr worker dispatch and completion | PENDING | |
-| Memory/task/cgroup/OOM observation | PENDING | |
-| Cleanup and restart-rate state | PENDING | |
+## Checking a host
 
-Baseline and read-only effective audit:
+From the checkout, verify the shipped unit, then the installed one:
 
-```bash
-uv run python -m local_voice_harness.service_units --require-systemd-analyze
-# Require rooted staged user context when the installed systemd supports it:
-uv run python -m local_voice_harness.service_units \
-  --require-systemd-analyze --require-user-context
-# This is a separate direct user-context check, not a substitute for staged output:
-systemd-analyze --user verify systemd/user/*.service
-systemd-analyze verify systemd/user/*.service
-# This intentionally replaces a preserved standalone dictation unit. Review and
-# migrate any backend.env/custom unit settings before running it.
-voice-harness services install --force --replace-dictation
-systemctl --user daemon-reload
-voice-harness services audit
+```fish
+uv run python -m local_dictation.service_units --require-systemd-analyze
+dictate services audit
 ```
 
-Without `--replace-dictation`, the installer deliberately preserves a differing
-standalone `dictation.service`; that preserved unit has not adopted this hardening
-policy and may still load an unrestricted `EnvironmentFile`. Treat a successful
-post-install audit as mandatory evidence that the shipped hardened unit and effective
-drop-ins are active.
+To confirm that your user manager actually enforces the file-system sandbox,
+run a throwaway unit with the same home protection. It should fail with
+`Read-only file system`:
 
-The staged verifier prints a structured context result. On systemd versions that
-reject `--user` together with `--root`, it labels rooted user context `unsupported`
-and may perform a distinct staged system-context syntax check. That fallback is never
-reported as user-context verification; `--require-user-context` fails in this case.
-
-Denied-operation probes use transient throwaway units with the same relevant
-directives; success means the Python operation fails with `PermissionError` or
-`EPERM`. They do not alter the installed units:
-
-```bash
-systemd-run --user --wait --collect --pipe --unit=voice-harness-write-probe \
-  --property=ProtectSystem=strict --property=ProtectHome=read-only \
-  /usr/bin/python -c 'open("/etc/voice-harness-probe", "w")'
-
+```fish
+systemd-run --user --wait --collect --pipe \
+    --property=ProtectHome=read-only \
+    python3 -c 'from pathlib import Path; Path.home().joinpath("ld-probe").touch()'
 ```
 
-For CUDA cold starts, stop the model services, remove only their disposable runtime
-caches, then start them individually. Do not remove model caches under home:
+Watch memory, tasks, and restarts while dictating:
 
-```bash
-systemctl --user stop dictation.service voice-harness-llm.service voice-harness-tts.service
-rm -rf \
-  "$XDG_RUNTIME_DIR/dictation/cuda-cache" \
-  "$XDG_RUNTIME_DIR/voice-harness-llm/cuda-cache" \
-  "$XDG_RUNTIME_DIR/voice-harness-tts/cuda-cache"
-systemctl --user start dictation.service voice-harness-llm.service voice-harness-tts.service
-systemctl --user is-active dictation.service voice-harness-llm.service voice-harness-tts.service
-curl --fail http://127.0.0.1:8090/health
-ss --tcp --listening --numeric | rg '127\.0\.0\.1:8090'
-nvidia-smi
-test -d "$XDG_RUNTIME_DIR/dictation/cuda-cache"
-test -d "$XDG_RUNTIME_DIR/voice-harness-llm/cuda-cache"
-test -d "$XDG_RUNTIME_DIR/voice-harness-tts/cuda-cache"
+```fish
+systemctl --user show local-dictation.service \
+    --property=MemoryCurrent --property=MemoryPeak --property=TasksCurrent \
+    --property=NRestarts --property=Result
 ```
 
-Exercise PipeWire and desktop/session helpers before dispatching a read-only worker:
-
-```bash
-pw-record --version
-pw-play --version
-wpctl status
-notify-send "Voice harness hardening smoke"
-voice-harness begin
-# Speak a short sentence, then:
-voice-harness end
-voice-harness services start
-voice-harness text "Reply with one short sentence."
-voice-harness text "Use Cursor to inspect this repository and report its branch without changing files."
-voice-harness status
-herdr agent list
-```
-
-Observe cgroup pressure and OOM/restart state without intentionally exhausting memory:
-
-```bash
-journalctl --user -u dictation.service -u voice-harness-llm.service -u voice-harness-tts.service -u voice-harness-wake.service -n 200
-systemctl --user show dictation.service voice-harness-llm.service voice-harness-tts.service voice-harness-wake.service \
-  --property=MemoryCurrent --property=MemoryPeak --property=MemoryHigh \
-  --property=MemoryMax --property=TasksCurrent --property=TasksMax \
-  --property=NRestarts --property=Result
-oomctl
-voice-harness services stop
-```
-
-Also complete the microphone, playback, desktop-context, wake/barge-in, GitHub,
-Herdr, and cleanup checks in [the hardware smoke guide](hardware-smoke.md). Verify
-that no service is restart-looping, no model falls back unexpectedly to CPU, TTS can
-read an optional reference WAV, first-start dictation can populate its cache, browser
-automation still works on X11 or the configured Wayland compositor, and detached
-workers can finish after the foreground timeout.
+The [hardware smoke checks](hardware-smoke.md) cover CUDA model loading,
+capture, and text insertion.

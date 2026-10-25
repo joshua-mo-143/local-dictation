@@ -1,29 +1,33 @@
 from __future__ import annotations
 
+import inspect
 import io
 import json
-import sqlite3
+import os
+import socket
 import subprocess
-import time
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import cli
-from local_voice_harness.diagnostics import checks, runner
-from local_voice_harness.diagnostics.model import (
+from local_dictation import desktop, diagnostics
+from local_dictation.diagnostics import checks, runner
+from local_dictation.diagnostics.model import (
     PROBLEM_SEVERITIES,
     SEVERITY_RANK,
     CheckResult,
     Repair,
     Severity,
 )
-from local_voice_harness.integrations.linear import CapabilityStatus
-from local_voice_harness.user_config import (
+from local_dictation.user_config import (
+    ComputeDevice,
     UserConfigurationError,
     default_user_config,
 )
+
+UNIT = "local-dictation.service"
 
 
 def _result(severity: Severity, name: str = "x", **kwargs: object) -> CheckResult:
@@ -44,12 +48,28 @@ def _completed(
     )
 
 
-def _snapshot():
+def _snapshot(
+    *,
+    inject: str = "auto",
+    source: str = "",
+    device: ComputeDevice = ComputeDevice.AUTO,
+) -> checks.DiagnosticSnapshot:
     config = default_user_config()
     return checks.DiagnosticSnapshot(
-        config=config,
-        registry=checks.build_integration_registry(config),
+        config=replace(
+            config,
+            stt=replace(config.stt, device=device),
+            dictation=replace(config.dictation, inject=inject, source=source),
+        )
     )
+
+
+def _broken_snapshot(message: str = "bad config.toml") -> checks.DiagnosticSnapshot:
+    return checks.DiagnosticSnapshot(config=None, error=UserConfigurationError(message))
+
+
+def _by_name(results: list[CheckResult]) -> dict[str, CheckResult]:
+    return {result.name: result for result in results}
 
 
 class ModelTests(unittest.TestCase):
@@ -75,16 +95,17 @@ class RunnerTests(unittest.TestCase):
         def boom() -> list[CheckResult]:
             raise RuntimeError("kaboom")
 
-        results = runner.run_diagnostics([boom])
+        results = runner.run_diagnostics([boom], snapshot=_snapshot())
         self.assertEqual(len(results), 1)
         self.assertIs(results[0].severity, Severity.FATAL)
+        self.assertEqual(results[0].category, "internal")
         self.assertIn("kaboom", results[0].detail)
 
     def test_run_diagnostics_redacts_crash_details(self) -> None:
         def boom() -> list[CheckResult]:
             raise RuntimeError("token=supersecretvalue")
 
-        results = runner.run_diagnostics([boom])
+        results = runner.run_diagnostics([boom], snapshot=_snapshot())
 
         self.assertNotIn("supersecretvalue", results[0].detail)
         self.assertIn("[REDACTED]", results[0].detail)
@@ -94,7 +115,8 @@ class RunnerTests(unittest.TestCase):
             [
                 lambda: [_result(Severity.OK, "a")],
                 lambda: [_result(Severity.WARNING, "b")],
-            ]
+            ],
+            snapshot=_snapshot(),
         )
         self.assertEqual([r.name for r in results], ["a", "b"])
 
@@ -114,22 +136,25 @@ class RunnerTests(unittest.TestCase):
         load.assert_called_once_with()
         self.assertEqual(observed, [snapshot, snapshot])
 
+    def test_snapshot_load_captures_configuration_errors(self) -> None:
+        error = UserConfigurationError("stt.device must be one of: auto, cpu, cuda")
+        with mock.patch.object(checks, "load_user_config", side_effect=error):
+            snapshot = checks.DiagnosticSnapshot.load()
+
+        self.assertIsNone(snapshot.config)
+        self.assertIs(snapshot.error, error)
+
     def test_malformed_config_is_one_direct_fatal_beside_independent_checks(
         self,
     ) -> None:
-        snapshot = checks.DiagnosticSnapshot(
-            config=None,
-            registry=None,
-            error=UserConfigurationError("bad config.toml"),
-        )
         results = runner.run_diagnostics(
             [
-                checks.check_backend_configuration,
+                checks.check_configuration,
                 lambda _snapshot: [_result(Severity.OK, "independent")],
-                checks.check_model_file,
-                checks.check_optional_integrations,
+                checks.check_compute_mode,
+                checks.check_cuda,
             ],
-            snapshot=snapshot,
+            snapshot=_broken_snapshot(),
         )
 
         self.assertEqual(
@@ -137,21 +162,6 @@ class RunnerTests(unittest.TestCase):
             ["configuration:user", "independent"],
         )
         self.assertIn("bad config.toml", results[0].detail)
-
-    def test_malformed_config_diagnostic_is_redacted(self) -> None:
-        snapshot = checks.DiagnosticSnapshot(
-            config=None,
-            registry=None,
-            error=UserConfigurationError("bad config.toml: token=supersecretvalue"),
-        )
-
-        results = runner.run_diagnostics(
-            [checks.check_backend_configuration],
-            snapshot=snapshot,
-        )
-
-        self.assertNotIn("supersecretvalue", results[0].detail)
-        self.assertIn("[REDACTED]", results[0].detail)
 
     def test_render_json_reports_summary_and_health(self) -> None:
         results = [_result(Severity.FATAL, "a"), _result(Severity.OK, "b")]
@@ -168,7 +178,7 @@ class RunnerTests(unittest.TestCase):
     def test_render_human_groups_and_headline(self) -> None:
         repair = Repair(summary="restart svc", action=lambda: "ok")
         results = [
-            _result(Severity.FATAL, "fatal-one"),
+            _result(Severity.FATAL, "fatal-one", suggestion="dictate services logs"),
             _result(Severity.WARNING, "warn-one", repair=repair),
             _result(Severity.UNAVAILABLE, "opt-one"),
             _result(Severity.OK, "ok-one"),
@@ -177,17 +187,25 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("FATAL (1):", text)
         self.assertIn("WARNING (1):", text)
         self.assertIn("UNAVAILABLE (1):", text)
-        self.assertIn("unhealthy", text)
+        self.assertNotIn("ok-one", text)
+        self.assertIn("suggested: dictate services logs", text)
+        self.assertIn("repair available: restart svc", text)
+        self.assertIn("Dictation is unhealthy", text)
         self.assertIn("Summary: 1 fatal, 1 warning, 1 unavailable, 1 ok", text)
-        self.assertIn("doctor --fix", text)
+        self.assertIn("Run `dictate doctor --fix`", text)
 
     def test_render_human_healthy_message(self) -> None:
         text = runner.render_human([_result(Severity.OK, "a")])
-        self.assertIn("looks healthy", text)
+        self.assertIn("Dictation looks healthy", text)
 
     def test_render_human_degraded_message(self) -> None:
         text = runner.render_human([_result(Severity.WARNING, "a")])
         self.assertIn("usable but some features are degraded", text)
+
+    def test_render_human_omits_fix_hint_for_healthy_repairable_results(self) -> None:
+        repair = Repair(summary="restart svc", action=lambda: "ok")
+        text = runner.render_human([_result(Severity.OK, "a", repair=repair)])
+        self.assertNotIn("doctor --fix", text)
 
 
 class ApplyRepairTests(unittest.TestCase):
@@ -252,8 +270,32 @@ class ApplyRepairTests(unittest.TestCase):
         )
         self.assertEqual(ran, [])
 
+    def test_default_confirmation_accepts_only_yes(self) -> None:
+        for answer, expected in (
+            ("y", True),
+            (" YES ", True),
+            ("", False),
+            ("n", False),
+        ):
+            with self.subTest(answer=answer):
+                with mock.patch("builtins.input", return_value=answer) as prompt:
+                    self.assertIs(runner._default_confirm("Apply?"), expected)
+                prompt.assert_called_once_with("Apply? [y/N] ")
+
+    def test_default_confirmation_declines_without_input(self) -> None:
+        with mock.patch("builtins.input", side_effect=EOFError):
+            self.assertFalse(runner._default_confirm("Apply?"))
+
 
 class DoctorEntryTests(unittest.TestCase):
+    def test_package_exports_keyword_only_doctor(self) -> None:
+        self.assertIs(diagnostics.doctor, runner.doctor)
+        self.assertIs(diagnostics.ALL_CHECKS, checks.ALL_CHECKS)
+        parameters = inspect.signature(diagnostics.doctor).parameters
+        for name in ("json_output", "fix"):
+            self.assertIs(parameters[name].kind, inspect.Parameter.KEYWORD_ONLY)
+            self.assertIs(parameters[name].default, False)
+
     def test_doctor_json_mode_returns_zero_without_fatal(self) -> None:
         out = io.StringIO()
         code = runner.doctor(
@@ -264,6 +306,12 @@ class DoctorEntryTests(unittest.TestCase):
         self.assertEqual(code, 0)
         payload = json.loads(out.getvalue())
         self.assertTrue(payload["healthy"])
+
+    def test_doctor_human_mode_prints_report(self) -> None:
+        out = io.StringIO()
+        code = runner.doctor(checks=[lambda: [_result(Severity.OK, "a")]], out=out)
+        self.assertEqual(code, 0)
+        self.assertIn("Dictation looks healthy", out.getvalue())
 
     def test_doctor_returns_one_on_fatal(self) -> None:
         out = io.StringIO()
@@ -311,567 +359,562 @@ class DoctorEntryTests(unittest.TestCase):
         confirm.assert_not_called()
 
 
+class ConfigurationCheckTests(unittest.TestCase):
+    def test_malformed_configuration_is_fatal_with_generic_path(self) -> None:
+        results = checks.check_configuration(_broken_snapshot())
+
+        self.assertEqual(len(results), 1)
+        self.assertIs(results[0].severity, Severity.FATAL)
+        self.assertIn(
+            "$XDG_CONFIG_HOME/local-dictation/config.toml", results[0].suggestion or ""
+        )
+
+    def test_malformed_configuration_diagnostic_is_redacted(self) -> None:
+        results = checks.check_configuration(
+            _broken_snapshot("bad config.toml: token=supersecretvalue")
+        )
+
+        self.assertNotIn("supersecretvalue", results[0].detail)
+        self.assertIn("[REDACTED]", results[0].detail)
+
+    def test_valid_configuration_summarizes_stt_and_injection(self) -> None:
+        results = checks.check_configuration(
+            _snapshot(inject="type", device=ComputeDevice.CPU)
+        )
+
+        self.assertIs(results[0].severity, Severity.OK)
+        self.assertIn("backend=parakeet", results[0].detail)
+        self.assertIn("device=cpu", results[0].detail)
+        self.assertIn("inject=type", results[0].detail)
+
+
 class ExecutableCheckTests(unittest.TestCase):
-    def test_missing_required_executable_is_fatal(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
-            results = checks.check_required_executables()
-        self.assertTrue(all(r.severity is Severity.FATAL for r in results))
-        self.assertTrue(all(r.suggestion for r in results))
+    def _check(
+        self,
+        snapshot: checks.DiagnosticSnapshot,
+        session: desktop.Desktop | None,
+        *,
+        location: str | None = None,
+    ) -> tuple[list[CheckResult], mock.Mock]:
+        with (
+            mock.patch.object(
+                checks, "get_desktop", return_value=session
+            ) as get_desktop,
+            mock.patch.object(checks, "_which", return_value=location),
+        ):
+            return checks.check_executables(snapshot), get_desktop
 
-    def test_present_required_executable_is_ok(self) -> None:
-        with mock.patch.object(checks, "_which", return_value="/usr/bin/tool"):
-            results = checks.check_required_executables()
+    def test_x11_requires_xdotool_and_recommends_xclip(self) -> None:
+        results, _ = self._check(_snapshot(), desktop.X11Desktop())
+
+        by_name = _by_name(results)
+        self.assertEqual(
+            list(by_name),
+            ["executable:pw-record", "executable:xdotool", "executable:xclip"],
+        )
+        self.assertIs(by_name["executable:pw-record"].severity, Severity.FATAL)
+        self.assertEqual(
+            by_name["executable:pw-record"].suggestion,
+            "paru -S --needed pipewire-audio",
+        )
+        self.assertIs(by_name["executable:xdotool"].severity, Severity.FATAL)
+        self.assertEqual(
+            by_name["executable:xdotool"].suggestion, "paru -S --needed xdotool"
+        )
+        self.assertIs(by_name["executable:xclip"].severity, Severity.WARNING)
+        self.assertIn("types it instead", by_name["executable:xclip"].detail)
+
+    def test_wayland_compositors_require_window_tool_and_wtype(self) -> None:
+        for session, window_tool in (
+            (desktop.HyprlandDesktop(), "hyprctl"),
+            (desktop.SwayDesktop(), "swaymsg"),
+        ):
+            with self.subTest(window_tool=window_tool):
+                results, _ = self._check(_snapshot(inject="paste"), session)
+
+                by_name = _by_name(results)
+                self.assertEqual(
+                    list(by_name),
+                    [
+                        "executable:pw-record",
+                        f"executable:{window_tool}",
+                        "executable:wtype",
+                        "executable:wl-copy",
+                        "executable:wl-paste",
+                    ],
+                )
+                self.assertIs(
+                    by_name[f"executable:{window_tool}"].severity, Severity.FATAL
+                )
+                self.assertIsNone(by_name[f"executable:{window_tool}"].suggestion)
+                self.assertIs(by_name["executable:wtype"].severity, Severity.FATAL)
+                for clipboard in ("executable:wl-copy", "executable:wl-paste"):
+                    self.assertIs(by_name[clipboard].severity, Severity.WARNING)
+                    self.assertEqual(
+                        by_name[clipboard].suggestion, "paru -S --needed wl-clipboard"
+                    )
+
+    def test_type_mode_does_not_need_clipboard_tools(self) -> None:
+        results, _ = self._check(_snapshot(inject="type"), desktop.X11Desktop())
+
+        self.assertEqual(
+            [result.name for result in results],
+            ["executable:pw-record", "executable:xdotool"],
+        )
+
+    def test_stdout_mode_needs_only_capture_tools(self) -> None:
+        results, get_desktop = self._check(
+            _snapshot(inject="stdout"), desktop.X11Desktop()
+        )
+
+        self.assertEqual([result.name for result in results], ["executable:pw-record"])
+        get_desktop.assert_not_called()
+
+    def test_malformed_configuration_still_checks_capture_tools(self) -> None:
+        results, get_desktop = self._check(_broken_snapshot(), desktop.X11Desktop())
+
+        self.assertEqual([result.name for result in results], ["executable:pw-record"])
+        self.assertIs(results[0].severity, Severity.FATAL)
+        get_desktop.assert_not_called()
+
+    def test_desktops_without_supported_automation_add_no_tools(self) -> None:
+        degraded = desktop.DegradedWaylandDesktop("gnome", "GNOME Wayland is limited")
+        for session in (degraded, None):
+            with self.subTest(session=session):
+                results, _ = self._check(_snapshot(), session)
+                self.assertEqual(
+                    [result.name for result in results], ["executable:pw-record"]
+                )
+
+    def test_present_executables_are_ok(self) -> None:
+        results, _ = self._check(
+            _snapshot(), desktop.X11Desktop(), location="/usr/bin/tool"
+        )
+
         self.assertTrue(all(r.severity is Severity.OK for r in results))
+        self.assertTrue(all("/usr/bin/tool" in r.detail for r in results))
 
-    def test_executable_checks_use_configured_client_paths(self) -> None:
-        config = default_user_config()
-        configured = replace(
-            config,
-            platform=replace(
-                config.platform,
-                herdr_bin=Path("/opt/herdr"),
-                gh_bin=Path("/opt/gh"),
-            ),
-        )
-        snapshot = checks.DiagnosticSnapshot(
-            configured,
-            checks.build_integration_registry(configured),
-        )
 
-        with mock.patch.object(
-            checks, "_which", return_value="/configured/tool"
-        ) as which:
-            checks.check_required_executables(snapshot)
-            checks.check_optional_executables(snapshot)
-
-        self.assertIn(mock.call("/opt/herdr"), which.call_args_list)
-        self.assertIn(mock.call("/opt/gh"), which.call_args_list)
-
-    def test_missing_optional_executable_is_warning(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
-            results = checks.check_optional_executables()
-        self.assertTrue(all(r.severity is Severity.WARNING for r in results))
+class FocusAutomationTests(unittest.TestCase):
+    def _check(
+        self,
+        session: desktop.Desktop | None,
+        *,
+        snapshot: checks.DiagnosticSnapshot | None = None,
+        tool: str | None = "/usr/bin/tool",
+    ) -> tuple[CheckResult, mock.Mock]:
+        with (
+            mock.patch.object(
+                checks, "get_desktop", return_value=session
+            ) as get_desktop,
+            mock.patch.object(desktop.shutil, "which", return_value=tool),
+        ):
+            results = checks.check_focus_automation(snapshot or _snapshot())
+        self.assertEqual(len(results), 1)
+        return results[0], get_desktop
 
     def test_focus_automation_ok_when_x11_stack_present(self) -> None:
-        from local_voice_harness.desktop import X11Desktop
-
-        with (
-            mock.patch.object(checks, "get_desktop", return_value=X11Desktop()),
-            mock.patch(
-                "local_voice_harness.desktop.shutil.which",
-                return_value="/usr/bin/tool",
-            ),
-        ):
-            results = checks.check_focus_automation()
-        self.assertIs(results[0].severity, Severity.OK)
-        self.assertIn("X11", results[0].detail)
+        result, _ = self._check(desktop.X11Desktop())
+        self.assertIs(result.severity, Severity.OK)
+        self.assertIn("X11", result.detail)
 
     def test_focus_automation_ok_when_wayland_stack_present(self) -> None:
-        from local_voice_harness.desktop import HyprlandDesktop
-
-        with (
-            mock.patch.object(checks, "get_desktop", return_value=HyprlandDesktop()),
-            mock.patch(
-                "local_voice_harness.desktop.shutil.which",
-                return_value="/usr/bin/tool",
-            ),
-        ):
-            results = checks.check_focus_automation()
-        self.assertIs(results[0].severity, Severity.OK)
-        self.assertIn("hyprland", results[0].detail)
+        result, _ = self._check(desktop.HyprlandDesktop())
+        self.assertIs(result.severity, Severity.OK)
+        self.assertIn("hyprland", result.detail)
 
     def test_focus_automation_warns_without_any_stack(self) -> None:
-        from local_voice_harness.desktop import X11Desktop
+        result, _ = self._check(desktop.X11Desktop(), tool=None)
+        self.assertIs(result.severity, Severity.WARNING)
+        self.assertIn(
+            "dictate config set dictation.inject stdout", result.suggestion or ""
+        )
 
+    def test_focus_automation_warns_without_desktop_session(self) -> None:
+        result, _ = self._check(None)
+        self.assertIs(result.severity, Severity.WARNING)
+        self.assertIn("no desktop session", result.detail)
+        self.assertIn("dictation.inject stdout", result.suggestion or "")
+
+    def test_stdout_injection_does_not_need_focus_automation(self) -> None:
+        result, get_desktop = self._check(
+            desktop.DegradedWaylandDesktop("gnome", "GNOME Wayland is limited"),
+            snapshot=_snapshot(inject="stdout"),
+        )
+        self.assertIs(result.severity, Severity.OK)
+        self.assertIn("stdout", result.detail)
+        get_desktop.assert_not_called()
+
+
+class ServiceEnvironmentTests(unittest.TestCase):
+    def _check(self, environment: Path) -> CheckResult:
         with (
-            mock.patch.object(checks, "get_desktop", return_value=X11Desktop()),
-            mock.patch("local_voice_harness.desktop.shutil.which", return_value=None),
+            mock.patch.object(checks, "SERVICE_ENVIRONMENT", environment),
+            mock.patch.object(
+                checks,
+                "SERVICE_EXECUTABLE",
+                environment / "bin" / "local-dictation-server",
+            ),
         ):
-            results = checks.check_focus_automation()
-        self.assertIs(results[0].severity, Severity.WARNING)
+            results = checks.check_service_environment()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "venv:service")
+        return results[0]
 
-
-def _local_tts_snapshot():
-    config = default_user_config()
-    config = replace(config, providers=replace(config.providers, tts_provider="local"))
-    return checks.DiagnosticSnapshot(
-        config=config,
-        registry=checks.build_integration_registry(config),
-    )
-
-
-class PythonEnvironmentTests(unittest.TestCase):
     def test_present_environment_is_ok(self) -> None:
-        with mock.patch.object(Path, "exists", return_value=True):
-            results = checks.check_python_environments(_local_tts_snapshot())
-        self.assertTrue(all(r.severity is Severity.OK for r in results))
-        self.assertTrue(any("chatterbox" in result.name for result in results))
-
-    def test_missing_environment_is_fatal(self) -> None:
-        with mock.patch.object(Path, "exists", return_value=False):
-            results = checks.check_python_environments(_local_tts_snapshot())
-        self.assertTrue(all(r.severity is Severity.FATAL for r in results))
-        self.assertTrue(all(r.suggestion for r in results))
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = Path(temporary) / ".venv-service"
+            (environment / "bin").mkdir(parents=True)
+            (environment / "bin" / "local-dictation-server").touch()
+            result = self._check(environment)
+        self.assertIs(result.severity, Severity.OK)
 
     def test_incomplete_environment_is_warning(self) -> None:
-        def exists(self: Path) -> bool:
-            return "bin" not in self.parts
-
-        with mock.patch.object(Path, "exists", exists):
-            results = checks.check_python_environments(_local_tts_snapshot())
-        self.assertTrue(all(r.severity is Severity.WARNING for r in results))
-
-    def test_hosted_tts_skips_local_chatterbox_environment(self) -> None:
-        with mock.patch.object(Path, "exists", return_value=False):
-            results = checks.check_python_environments(_snapshot())
-        self.assertFalse(any("chatterbox" in result.name for result in results))
-        self.assertTrue(results)
-
-
-class ModelAndCudaTests(unittest.TestCase):
-    def test_model_present(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as temporary:
-            model = Path(temporary) / "model.gguf"
-            model.write_bytes(b"0" * 1024)
-            with mock.patch.object(checks, "MODEL_FILE", model):
-                results = checks.check_model_file(_snapshot())
-        self.assertIs(results[0].severity, Severity.OK)
+            environment = Path(temporary) / ".venv-service"
+            environment.mkdir()
+            result = self._check(environment)
+        self.assertIs(result.severity, Severity.WARNING)
+        self.assertIn("local-dictation-server", result.detail)
+        self.assertIn("scripts/install.sh", result.suggestion or "")
 
-    def test_model_missing_is_fatal(self) -> None:
-        snapshot = _snapshot()
-        assert snapshot.config is not None
-        config = snapshot.config
-        snapshot = replace(
-            snapshot,
-            config=replace(
-                config,
-                providers=replace(config.providers, llm_provider="local"),
-            ),
-        )
-        with mock.patch.object(checks, "MODEL_FILE", Path("/nonexistent/model.gguf")):
-            results = checks.check_model_file(snapshot)
-        self.assertIs(results[0].severity, Severity.FATAL)
-        self.assertIn("hf download", results[0].suggestion or "")
+    def test_missing_environment_is_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self._check(Path(temporary) / ".venv-service")
+        self.assertIs(result.severity, Severity.FATAL)
+        self.assertIn(f"{UNIT} cannot start", result.detail)
+        self.assertIn("scripts/install.sh", result.suggestion or "")
 
+
+class ModelCacheTests(unittest.TestCase):
     def test_model_cache_present(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.object(checks, "HUGGINGFACE_CACHE", Path(temporary)):
-                results = checks.check_model_caches()
+                results = checks.check_model_cache(_snapshot())
         self.assertIs(results[0].severity, Severity.OK)
 
-    def test_model_cache_absent_is_warning(self) -> None:
-        with mock.patch.object(checks, "HUGGINGFACE_CACHE", Path("/nonexistent/cache")):
-            results = checks.check_model_caches()
+    def test_model_cache_absent_names_the_configured_model(self) -> None:
+        with mock.patch.object(checks, "HUGGINGFACE_CACHE", Path("/nonexistent/hf")):
+            results = checks.check_model_cache(_snapshot())
         self.assertIs(results[0].severity, Severity.WARNING)
+        self.assertIn("parakeet model nemo-parakeet-tdt-0.6b-v2", results[0].detail)
+        self.assertIn("dictate services start", results[0].suggestion or "")
 
-    def test_cuda_missing_nvidia_smi_is_warning(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
-            results = checks.check_cuda()
-        self.assertIs(results[0].severity, Severity.WARNING)
+    def test_model_cache_absent_without_configuration_is_skipped(self) -> None:
+        with mock.patch.object(checks, "HUGGINGFACE_CACHE", Path("/nonexistent/hf")):
+            self.assertEqual(checks.check_model_cache(_broken_snapshot()), [])
 
-    def test_cuda_ok_when_nvidia_smi_succeeds(self) -> None:
+
+class ComputeAndCudaTests(unittest.TestCase):
+    def _cuda(
+        self,
+        device: ComputeDevice,
+        *,
+        location: str | None = "/usr/bin/nvidia-smi",
+        process: subprocess.CompletedProcess[str] | None = None,
+    ) -> tuple[CheckResult, mock.Mock]:
         with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/nvidia-smi"),
-            mock.patch.object(checks, "_run", return_value=_completed(0, "GPU")),
+            mock.patch.object(checks, "_which", return_value=location),
+            mock.patch.object(checks, "_run", return_value=process) as run,
         ):
-            results = checks.check_cuda()
+            results = checks.check_cuda(_snapshot(device=device))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "gpu:cuda")
+        return results[0], run
+
+    def test_cpu_compute_resolves_without_probing_cuda(self) -> None:
+        snapshot = _snapshot(device=ComputeDevice.CPU)
+        with (
+            mock.patch.object(checks, "_which") as which,
+            mock.patch.object(checks, "_run") as run,
+        ):
+            compute = checks.check_compute_mode(snapshot)
+            cuda = checks.check_cuda(snapshot)
+
+        self.assertIn("effective device=cpu", compute[0].detail)
+        self.assertIs(cuda[0].severity, Severity.OK)
+        which.assert_not_called()
+        run.assert_not_called()
+
+    def test_auto_compute_is_resolved_at_service_start(self) -> None:
+        results = checks.check_compute_mode(_snapshot())
+        self.assertEqual(results[0].name, "compute:stt")
         self.assertIs(results[0].severity, Severity.OK)
+        self.assertIn("device=auto", results[0].detail)
+        self.assertIn("resolved at service start", results[0].detail)
 
-    def test_cuda_warns_when_nvidia_smi_fails(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/nvidia-smi"),
+    def test_compute_checks_skip_malformed_configuration(self) -> None:
+        self.assertEqual(checks.check_compute_mode(_broken_snapshot()), [])
+        self.assertEqual(checks.check_cuda(_broken_snapshot()), [])
+
+    def test_auto_without_nvidia_smi_warns_and_offers_cpu(self) -> None:
+        result, run = self._cuda(ComputeDevice.AUTO, location=None)
+        self.assertIs(result.severity, Severity.WARNING)
+        self.assertIn("falls back", result.detail)
+        self.assertIn("dictate config set stt.device cpu", result.suggestion or "")
+        run.assert_not_called()
+
+    def test_explicit_cuda_without_nvidia_smi_is_fatal(self) -> None:
+        result, _ = self._cuda(ComputeDevice.CUDA, location=None)
+        self.assertIs(result.severity, Severity.FATAL)
+        self.assertEqual(result.suggestion, checks.INSTALL_HINTS["nvidia-smi"])
+
+    def test_failing_nvidia_smi_reports_first_error_line(self) -> None:
+        for device, severity in (
+            (ComputeDevice.AUTO, Severity.WARNING),
+            (ComputeDevice.CUDA, Severity.FATAL),
+        ):
+            with self.subTest(device=device):
+                result, _ = self._cuda(
+                    device,
+                    process=_completed(9, "", "driver mismatch\nsecond line"),
+                )
+                self.assertIs(result.severity, severity)
+                self.assertIn("failed to query the GPU: driver mismatch", result.detail)
+                self.assertNotIn("second line", result.detail)
+                self.assertIn("nvidia-smi", result.suggestion or "")
+
+    def test_unrunnable_nvidia_smi_is_reported(self) -> None:
+        result, _ = self._cuda(ComputeDevice.AUTO, process=None)
+        self.assertIs(result.severity, Severity.WARNING)
+        self.assertIn("nvidia-smi failed to query the GPU;", result.detail)
+
+    def test_working_nvidia_smi_is_ok(self) -> None:
+        result, run = self._cuda(ComputeDevice.CUDA, process=_completed(0, "GPU"))
+        self.assertIs(result.severity, Severity.OK)
+        run.assert_called_once_with(["nvidia-smi"], timeout=10)
+
+
+class PipewireSourceTests(unittest.TestCase):
+    SOURCES = ("alsa_input.pci-0000_00_1f.3.analog-stereo", "echo_cancel_source")
+
+    def _check(
+        self,
+        snapshot: checks.DiagnosticSnapshot,
+        *,
+        wpctl: str | None = "/usr/bin/wpctl",
+        sources: tuple[str, ...] | Exception = SOURCES,
+    ) -> tuple[CheckResult, mock.Mock]:
+        listing = (
             mock.patch.object(
-                checks, "_run", return_value=_completed(1, "", "driver error")
-            ),
-        ):
-            results = checks.check_cuda()
-        self.assertIs(results[0].severity, Severity.WARNING)
-
-
-_WPCTL_STATUS = """\
-Audio
- ├─ Devices:
- │      40. alsa_card.pci-0000_00_1f.3
- ├─ Sinks:
- │  *   62. alsa_output.pci-0000_00_1f.3.analog-stereo [vol: 0.50]
- ├─ Sources:
- │  *   63. alsa_input.pci-0000_00_1f.3.analog-stereo [vol: 1.00]
- ├─ Filters:
-"""
-
-_WPCTL_FILTER_STATUS = _WPCTL_STATUS.replace(
-    " ├─ Filters:\n",
-    " ├─ Filters:\n │      72. voice_harness_aec_sink\n │  *   73. voice_harness_aec\n",
-)
-
-
-class PipewireTests(unittest.TestCase):
-    def test_terminal_section_header_is_parsed(self) -> None:
-        status = """\
-Audio
- ├─ Sinks:
- │  *   62. output.node
- └─ Sources:
-    *   63. input.node
-"""
-        self.assertEqual(
-            checks.pipewire_section_devices(status, "Sources"),
-            ("input.node",),
-        )
-
-    def test_list_capture_sources_includes_sources_and_filters(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
-            mock.patch.object(
-                checks, "_run", return_value=_completed(0, _WPCTL_FILTER_STATUS)
-            ),
-        ):
-            names = checks.list_pipewire_capture_sources()
-        self.assertEqual(
-            names,
-            (
-                "alsa_input.pci-0000_00_1f.3.analog-stereo",
-                "voice_harness_aec_sink",
-                "voice_harness_aec",
-            ),
-        )
-
-    def test_list_capture_sources_requires_wpctl(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value=None),
-            self.assertRaisesRegex(UserConfigurationError, "wpctl not found"),
-        ):
-            checks.list_pipewire_capture_sources()
-
-    def test_missing_wpctl_is_fatal(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
-            results = checks.check_pipewire_devices(_snapshot())
-        self.assertIs(results[0].severity, Severity.FATAL)
-        self.assertIn("system default source", results[0].detail)
-
-    def test_wpctl_ok_uses_system_default_when_unconfigured(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
-            mock.patch.object(
-                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
-            ) as run,
-        ):
-            results = checks.check_pipewire_devices(_snapshot())
-        self.assertIs(results[0].severity, Severity.OK)
-        self.assertIn("system default source", results[0].detail)
-        self.assertIn("system default sink", results[0].detail)
-        run.assert_called_once_with(["wpctl", "status", "--name"], timeout=5)
-
-    def test_configured_node_names_match_capture_targets(self) -> None:
-        snapshot = _snapshot()
-        assert snapshot.config is not None
-        snapshot = checks.DiagnosticSnapshot(
-            config=replace(
-                snapshot.config,
-                audio=replace(
-                    snapshot.config.audio,
-                    source="alsa_input.pci-0000_00_1f.3.analog-stereo",
-                    sink="alsa_output.pci-0000_00_1f.3.analog-stereo",
-                ),
-            ),
-            registry=snapshot.registry,
+                checks, "list_pipewire_capture_sources", side_effect=sources
+            )
+            if isinstance(sources, Exception)
+            else mock.patch.object(
+                checks, "list_pipewire_capture_sources", return_value=sources
+            )
         )
         with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
-            mock.patch.object(
-                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
-            ),
+            mock.patch.object(checks, "_which", return_value=wpctl),
+            listing as list_sources,
         ):
-            results = checks.check_pipewire_devices(snapshot)
-        self.assertIs(results[0].severity, Severity.OK)
+            results = checks.check_pipewire_source(snapshot)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "audio:pipewire")
+        return results[0], list_sources
 
-    def test_configured_filter_node_matches_virtual_capture_target(self) -> None:
-        snapshot = _snapshot()
-        assert snapshot.config is not None
-        snapshot = checks.DiagnosticSnapshot(
-            config=replace(
-                snapshot.config,
-                audio=replace(snapshot.config.audio, source="voice_harness_aec"),
-            ),
-            registry=snapshot.registry,
-        )
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
-            mock.patch.object(
-                checks, "_run", return_value=_completed(0, _WPCTL_FILTER_STATUS)
-            ),
-        ):
-            results = checks.check_pipewire_devices(snapshot)
-        self.assertIs(results[0].severity, Severity.OK)
+    def test_missing_wpctl_is_fatal_with_install_hint(self) -> None:
+        result, list_sources = self._check(_snapshot(), wpctl=None)
+        self.assertIs(result.severity, Severity.FATAL)
+        self.assertIn("system default source", result.detail)
+        self.assertEqual(result.suggestion, "paru -S --needed wireplumber")
+        list_sources.assert_not_called()
 
-    def test_missing_configured_dictation_source_is_fatal(self) -> None:
-        snapshot = _snapshot()
-        assert snapshot.config is not None
-        snapshot = checks.DiagnosticSnapshot(
-            config=replace(
-                snapshot.config,
-                dictation=replace(
-                    snapshot.config.dictation,
-                    source="missing-dictation-mic",
-                ),
-            ),
-            registry=snapshot.registry,
-        )
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
-            mock.patch.object(
-                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
-            ),
-        ):
-            results = checks.check_pipewire_devices(snapshot)
-        self.assertIs(results[0].severity, Severity.FATAL)
-        self.assertIn("missing-dictation-mic", results[0].detail)
-        self.assertIn("dictation.source", results[0].suggestion or "")
+    def test_unconfigured_source_uses_system_default(self) -> None:
+        result, _ = self._check(_snapshot())
+        self.assertIs(result.severity, Severity.OK)
+        self.assertIn("system default source", result.detail)
 
-    def test_wpctl_failure_is_fatal(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
-            mock.patch.object(checks, "_run", return_value=_completed(1)),
-        ):
-            results = checks.check_pipewire_devices(_snapshot())
-        self.assertIs(results[0].severity, Severity.FATAL)
+    def test_configured_filter_node_is_a_valid_capture_target(self) -> None:
+        result, _ = self._check(_snapshot(source="echo_cancel_source"))
+        self.assertIs(result.severity, Severity.OK)
+        self.assertIn("echo_cancel_source", result.detail)
 
     def test_missing_configured_source_is_fatal(self) -> None:
-        snapshot = _snapshot()
-        assert snapshot.config is not None
-        snapshot = checks.DiagnosticSnapshot(
-            config=replace(
-                snapshot.config,
-                audio=replace(snapshot.config.audio, source="missing-mic"),
-            ),
-            registry=snapshot.registry,
+        result, _ = self._check(_snapshot(source="missing-dictation-mic"))
+        self.assertIs(result.severity, Severity.FATAL)
+        self.assertIn("missing-dictation-mic", result.detail)
+        self.assertIn("echo_cancel_source", result.detail)
+        self.assertEqual(result.suggestion, "dictate config set dictation.source")
+
+    def test_unusable_pipewire_is_fatal(self) -> None:
+        error = UserConfigurationError(
+            "wpctl status failed; PipeWire may not be running"
         )
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
-            mock.patch.object(
-                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
-            ),
-        ):
-            results = checks.check_pipewire_devices(snapshot)
-        self.assertIs(results[0].severity, Severity.FATAL)
-        self.assertIn("missing-mic", results[0].detail)
+        result, _ = self._check(_snapshot(), sources=error)
+        self.assertIs(result.severity, Severity.FATAL)
+        self.assertIn("wpctl status failed", result.detail)
+        self.assertIn("pipewire wireplumber", result.suggestion or "")
+
+    def test_malformed_configuration_reports_pipewire_status(self) -> None:
+        result, _ = self._check(_broken_snapshot())
+        self.assertIs(result.severity, Severity.OK)
 
 
-class SystemdUnitTests(unittest.TestCase):
-    def _run_with(
-        self, tmp: Path, installed: set[str], props: dict[str, dict[str, str]]
-    ) -> list[CheckResult]:
-        for name in installed:
-            (tmp / name).write_text("[Unit]\n")
+_HEALTHY_UNIT = {
+    "LoadState": "loaded",
+    "ActiveState": "active",
+    "SubState": "running",
+    "Result": "success",
+    "NRestarts": "0",
+    "UnitFileState": "enabled",
+}
 
-        def show(name: str, _properties: object) -> dict[str, str]:
-            return props.get(name, {})
 
+class ServiceUnitTests(unittest.TestCase):
+    def _check(
+        self,
+        properties: dict[str, str],
+        *,
+        installed: bool = True,
+        available: bool = True,
+    ) -> tuple[CheckResult, mock.Mock]:
         supervisor = mock.Mock()
-        supervisor.available.return_value = True
-        with (
-            mock.patch.object(checks, "SYSTEMD_USER_DIR", tmp),
-            mock.patch.object(checks, "_systemctl_show", side_effect=show),
-            mock.patch.object(checks, "user_services", return_value=supervisor),
-        ):
-            return checks.check_systemd_units()
-
-    def test_not_installed_is_fatal(self) -> None:
-        import tempfile
-
+        supervisor.available.return_value = available
+        supervisor.show.return_value = properties
         with tempfile.TemporaryDirectory() as temporary:
-            results = self._run_with(Path(temporary), set(), {})
-        self.assertTrue(all(r.severity is Severity.FATAL for r in results))
-        self.assertTrue(all("not installed" in r.detail for r in results))
+            unit_dir = Path(temporary)
+            if installed:
+                (unit_dir / UNIT).write_text("[Unit]\n")
+            with (
+                mock.patch.object(checks, "SYSTEMD_USER_DIR", unit_dir),
+                mock.patch.object(checks, "user_services", return_value=supervisor),
+            ):
+                results = checks.check_service_unit()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, f"unit:{UNIT}")
+        return results[0], supervisor
 
-    def test_restart_loop_is_fatal_with_repair(self) -> None:
-        import tempfile
+    def test_unavailable_supervision_skips_unit_state(self) -> None:
+        result, supervisor = self._check({}, available=False)
+        self.assertIs(result.severity, Severity.WARNING)
+        self.assertNotIn("not installed", result.detail)
+        supervisor.show.assert_not_called()
 
-        props = {
-            name: {"ActiveState": "activating", "Result": "success", "NRestarts": "9"}
-            for name in checks.SERVICE_FILES
-        }
-        with tempfile.TemporaryDirectory() as temporary:
-            results = self._run_with(Path(temporary), set(checks.SERVICE_FILES), props)
-        self.assertTrue(all(r.severity is Severity.FATAL for r in results))
-        self.assertTrue(all(r.repair is not None for r in results))
-
-    def test_failed_unit_is_fatal(self) -> None:
-        import tempfile
-
-        props = {
-            name: {
-                "ActiveState": "failed",
-                "SubState": "failed",
-                "Result": "exit-code",
-                "NRestarts": "0",
-            }
-            for name in checks.SERVICE_FILES
-        }
-        with tempfile.TemporaryDirectory() as temporary:
-            results = self._run_with(Path(temporary), set(checks.SERVICE_FILES), props)
-        self.assertTrue(all(r.severity is Severity.FATAL for r in results))
-
-    def test_always_on_inactive_is_warning(self) -> None:
-        import tempfile
-
-        props = {
-            name: {
+    def test_unknown_unit_is_not_installed(self) -> None:
+        result, _ = self._check(
+            {
+                "LoadState": "not-found",
                 "ActiveState": "inactive",
                 "SubState": "dead",
                 "Result": "success",
                 "NRestarts": "0",
-                "UnitFileState": "enabled",
-            }
-            for name in checks.SERVICE_FILES
-        }
-        with tempfile.TemporaryDirectory() as temporary:
-            results = self._run_with(Path(temporary), set(checks.SERVICE_FILES), props)
-        by_name = {r.name: r for r in results}
-        self.assertIs(
-            by_name["unit:voice-harness-wake.service"].severity, Severity.WARNING
+                "UnitFileState": "",
+            },
+            installed=False,
         )
-        # on-demand services inactive is healthy
-        self.assertIs(by_name["unit:voice-harness-llm.service"].severity, Severity.OK)
+        self.assertIs(result.severity, Severity.FATAL)
+        self.assertIn("is not installed", result.detail)
+        self.assertEqual(result.suggestion, "dictate services install")
 
-    def test_disabled_always_on_unit_is_warning(self) -> None:
-        import tempfile
+    def test_unit_file_that_systemd_has_not_loaded_needs_install(self) -> None:
+        result, _ = self._check({**_HEALTHY_UNIT, "LoadState": "not-found"})
+        self.assertIs(result.severity, Severity.FATAL)
+        self.assertIn("systemd has not loaded it", result.detail)
+        self.assertEqual(result.suggestion, "dictate services install")
 
-        props = {
-            name: {
-                "ActiveState": "active",
-                "SubState": "running",
-                "Result": "success",
-                "NRestarts": "0",
-                "UnitFileState": "disabled",
+    def test_unqueryable_missing_unit_is_not_installed(self) -> None:
+        result, _ = self._check({}, installed=False)
+        self.assertIs(result.severity, Severity.FATAL)
+        self.assertIn("is not installed", result.detail)
+
+    def test_restart_loop_is_fatal_with_repair(self) -> None:
+        result, _ = self._check(
+            {**_HEALTHY_UNIT, "ActiveState": "activating", "NRestarts": "9"}
+        )
+        self.assertIs(result.severity, Severity.FATAL)
+        self.assertIn("restarted 9 times", result.detail)
+        self.assertEqual(result.suggestion, "dictate services logs")
+        assert result.repair is not None
+        self.assertEqual(result.repair.summary, f"restart {UNIT}")
+
+    def test_failed_unit_is_fatal_with_repair(self) -> None:
+        result, _ = self._check(
+            {
+                **_HEALTHY_UNIT,
+                "ActiveState": "failed",
+                "SubState": "failed",
+                "Result": "exit-code",
             }
-            for name in checks.SERVICE_FILES
-        }
-        with tempfile.TemporaryDirectory() as temporary:
-            results = self._run_with(Path(temporary), set(checks.SERVICE_FILES), props)
-        by_name = {r.name: r for r in results}
-        self.assertIs(by_name["unit:dictation.service"].severity, Severity.WARNING)
+        )
+        self.assertIs(result.severity, Severity.FATAL)
+        self.assertIn("result=exit-code", result.detail)
+        self.assertIsNotNone(result.repair)
 
-    def test_healthy_units_are_ok(self) -> None:
-        import tempfile
+    def test_disabled_unit_is_warning(self) -> None:
+        result, _ = self._check({**_HEALTHY_UNIT, "UnitFileState": "disabled"})
+        self.assertIs(result.severity, Severity.WARNING)
+        self.assertIn("should start at login", result.detail)
+        self.assertEqual(result.suggestion, "dictate services install")
+        self.assertIsNone(result.repair)
 
-        props = {
-            name: {
-                "ActiveState": "active",
-                "SubState": "running",
-                "Result": "success",
-                "NRestarts": "0",
-                "UnitFileState": "enabled",
-            }
-            for name in checks.SERVICE_FILES
-        }
-        with tempfile.TemporaryDirectory() as temporary:
-            results = self._run_with(Path(temporary), set(checks.SERVICE_FILES), props)
-        self.assertTrue(all(r.severity is Severity.OK for r in results))
+    def test_inactive_unit_is_warning_with_restart_repair(self) -> None:
+        result, _ = self._check(
+            {**_HEALTHY_UNIT, "ActiveState": "inactive", "SubState": "dead"}
+        )
+        self.assertIs(result.severity, Severity.WARNING)
+        self.assertEqual(result.suggestion, "dictate services start")
+        self.assertIsNotNone(result.repair)
+
+    def test_healthy_unit_is_ok(self) -> None:
+        result, supervisor = self._check(_HEALTHY_UNIT)
+        self.assertIs(result.severity, Severity.OK)
+        self.assertIn("active=active", result.detail)
+        name, properties = supervisor.show.call_args.args
+        self.assertEqual(name, UNIT)
+        self.assertIn("LoadState", properties)
+
+    def test_unparseable_restart_count_is_treated_as_zero(self) -> None:
+        result, _ = self._check({**_HEALTHY_UNIT, "NRestarts": "[not set]"})
+        self.assertIs(result.severity, Severity.OK)
+        self.assertIn("restarts=0", result.detail)
 
 
-class SocketCheckTests(unittest.TestCase):
+class SttSocketTests(unittest.TestCase):
+    def _check(self, socket_path: Path, *, ready: bool, active: str) -> CheckResult:
+        with (
+            mock.patch.object(checks, "STT_SOCKET", socket_path),
+            mock.patch.object(checks, "socket_ready", return_value=ready),
+            mock.patch.object(checks, "_service_active_state", return_value=active),
+        ):
+            results = checks.check_stt_socket()
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "socket:stt")
+        return results[0]
+
     def test_socket_ready_is_ok(self) -> None:
-        with mock.patch.object(checks, "socket_ready", return_value=True):
-            result = checks._socket_result(
-                name="socket:stt",
-                label="STT",
-                socket_path=Path("/run/x.sock"),
-                unit="dictation.service",
-                always_on=True,
-            )
+        result = self._check(Path("/run/x.sock"), ready=True, active="active")
         self.assertIs(result.severity, Severity.OK)
 
     def test_socket_down_while_service_active_offers_restart(self) -> None:
-        with (
-            mock.patch.object(checks, "socket_ready", return_value=False),
-            mock.patch.object(checks, "_service_active_state", return_value="active"),
-        ):
-            result = checks._socket_result(
-                name="socket:stt",
-                label="STT",
-                socket_path=Path("/run/x.sock"),
-                unit="dictation.service",
-                always_on=True,
-            )
+        result = self._check(Path("/run/x.sock"), ready=False, active="active")
         self.assertIs(result.severity, Severity.WARNING)
-        self.assertIsNotNone(result.repair)
-        self.assertIn("restart", (result.repair.summary if result.repair else ""))
+        self.assertIn("may still be loading", result.detail)
+        assert result.repair is not None
+        self.assertEqual(result.repair.summary, f"restart {UNIT}")
 
     def test_stale_socket_offers_removal(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as temporary:
             socket_path = Path(temporary) / "x.sock"
             socket_path.write_text("stale")
-            with (
-                mock.patch.object(checks, "socket_ready", return_value=False),
-                mock.patch.object(
-                    checks, "_service_active_state", return_value="inactive"
-                ),
-            ):
-                result = checks._socket_result(
-                    name="socket:tts",
-                    label="TTS",
-                    socket_path=socket_path,
-                    unit="voice-harness-tts.service",
-                    always_on=False,
-                )
+            result = self._check(socket_path, ready=False, active="inactive")
         self.assertIs(result.severity, Severity.WARNING)
         self.assertIn("stale", result.detail)
-        self.assertIsNotNone(result.repair)
+        assert result.repair is not None
+        self.assertIn("remove stale socket", result.repair.summary)
 
-    def test_absent_on_demand_socket_is_ok(self) -> None:
-        with (
-            mock.patch.object(checks, "socket_ready", return_value=False),
-            mock.patch.object(checks, "_service_active_state", return_value="inactive"),
-        ):
-            result = checks._socket_result(
-                name="socket:tts",
-                label="TTS",
-                socket_path=Path("/nonexistent/x.sock"),
-                unit="voice-harness-tts.service",
-                always_on=False,
-            )
-        self.assertIs(result.severity, Severity.OK)
-
-    def test_absent_always_on_socket_is_warning(self) -> None:
-        with (
-            mock.patch.object(checks, "socket_ready", return_value=False),
-            mock.patch.object(checks, "_service_active_state", return_value="inactive"),
-        ):
-            result = checks._socket_result(
-                name="socket:stt",
-                label="STT",
-                socket_path=Path("/nonexistent/x.sock"),
-                unit="dictation.service",
-                always_on=True,
-            )
+    def test_absent_socket_suggests_starting_the_service(self) -> None:
+        result = self._check(Path("/nonexistent/x.sock"), ready=False, active="failed")
         self.assertIs(result.severity, Severity.WARNING)
+        self.assertIn(f"{UNIT} is failed", result.detail)
+        self.assertEqual(result.suggestion, "dictate services start")
+        self.assertIsNone(result.repair)
 
-    def test_llm_ready_reports_ok(self) -> None:
-        with (
-            mock.patch.object(checks, "socket_ready", return_value=True),
-            mock.patch.object(checks, "llm_ready", return_value=True),
-        ):
-            results = checks.check_runtime_sockets()
-        by_name = {r.name: r for r in results}
-        self.assertIs(by_name["socket:llm"].severity, Severity.OK)
-
-    def test_llm_down_while_active_offers_restart(self) -> None:
-        with (
-            mock.patch.object(checks, "socket_ready", return_value=True),
-            mock.patch.object(checks, "llm_ready", return_value=False),
-            mock.patch.object(checks, "_service_active_state", return_value="active"),
-        ):
-            results = checks.check_runtime_sockets()
-        by_name = {r.name: r for r in results}
-        self.assertIs(by_name["socket:llm"].severity, Severity.WARNING)
-        self.assertIsNotNone(by_name["socket:llm"].repair)
+    def test_service_state_is_unknown_when_systemctl_cannot_run(self) -> None:
+        supervisor = mock.Mock()
+        supervisor.show.side_effect = FileNotFoundError("systemctl")
+        with mock.patch.object(checks, "user_services", return_value=supervisor):
+            self.assertEqual(checks._service_active_state(UNIT), "unknown")
 
 
 class RepairActionTests(unittest.TestCase):
@@ -879,16 +922,16 @@ class RepairActionTests(unittest.TestCase):
         supervisor = mock.Mock()
         supervisor.restart.return_value = _completed(0)
         with mock.patch.object(checks, "user_services", return_value=supervisor):
-            repair = checks._restart_service_repair("dictation.service")
-            message = repair.action()
-        self.assertIn("restarted dictation.service", message)
+            message = checks._restart_service_repair(UNIT).action()
+        supervisor.restart.assert_called_once_with(UNIT)
+        self.assertEqual(message, f"restarted {UNIT}")
 
     def test_restart_service_repair_failure_raises(self) -> None:
         supervisor = mock.Mock()
         supervisor.restart.return_value = _completed(1, "", "boom")
         with mock.patch.object(checks, "user_services", return_value=supervisor):
-            repair = checks._restart_service_repair("dictation.service")
-            with self.assertRaises(checks.HarnessError) as caught:
+            repair = checks._restart_service_repair(UNIT)
+            with self.assertRaises(checks.DictationError) as caught:
                 repair.action()
         self.assertIn("boom", str(caught.exception))
 
@@ -896,375 +939,144 @@ class RepairActionTests(unittest.TestCase):
         supervisor = mock.Mock()
         supervisor.restart.side_effect = OSError("gone")
         with mock.patch.object(checks, "user_services", return_value=supervisor):
-            repair = checks._restart_service_repair("dictation.service")
-            with self.assertRaises(checks.HarnessError):
+            repair = checks._restart_service_repair(UNIT)
+            with self.assertRaises(checks.DictationError):
                 repair.action()
 
-    def test_remove_stale_socket_is_idempotent(self) -> None:
-        import tempfile
+    def _stale_socket(self, directory: str) -> Path:
+        path = Path(directory) / "stale.sock"
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(path))
+        listener.close()
+        return path
 
+    def test_remove_stale_socket_unlinks_unresponsive_socket(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._stale_socket(temporary)
+            message = checks._remove_stale_socket_repair(path).action()
+            self.assertFalse(path.exists())
+        self.assertIn("removed stale socket", message)
+
+    def test_remove_stale_socket_keeps_a_socket_that_responds_again(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._stale_socket(temporary)
+            with mock.patch.object(checks, "socket_ready", return_value=True):
+                message = checks._remove_stale_socket_repair(path).action()
+            self.assertTrue(path.is_socket())
+        self.assertIn("responding again", message)
+
+    def test_remove_stale_socket_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             missing = Path(temporary) / "gone.sock"
-            repair = checks._remove_stale_socket_repair(missing)
-            message = repair.action()
+            message = checks._remove_stale_socket_repair(missing).action()
         self.assertIn("nothing to do", message)
+
+    def test_remove_stale_socket_failure_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._stale_socket(temporary)
+            with (
+                mock.patch.object(Path, "unlink", side_effect=PermissionError("no")),
+                self.assertRaisesRegex(checks.DictationError, "could not remove"),
+            ):
+                checks._remove_stale_socket_repair(path).action()
 
 
 class RuntimeDirectoryTests(unittest.TestCase):
-    def test_writable_runtime_is_ok(self) -> None:
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as temporary:
+    def _check(
+        self, runtime: Path, state: Path, *, xdg: str | None
+    ) -> dict[str, CheckResult]:
+        with mock.patch.dict(os.environ):
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+            if xdg is not None:
+                os.environ["XDG_RUNTIME_DIR"] = xdg
             with (
-                mock.patch.object(checks, "RUNTIME", Path(temporary)),
-                mock.patch.object(checks, "STATE_DIR", Path(temporary) / "state"),
-                mock.patch.object(checks, "JOBS_DIR", Path(temporary) / "jobs"),
+                mock.patch.object(checks, "RUNTIME", runtime),
+                mock.patch.object(checks, "STATE_DIR", state),
             ):
                 results = checks.check_runtime_directories()
-        by_name = {r.name: r for r in results}
-        self.assertIs(by_name["runtime:xdg"].severity, Severity.OK)
+        return _by_name(results)
+
+    def test_writable_runtime_is_ok_and_missing_state_is_created_later(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            results = self._check(runtime, runtime / "state", xdg=temporary)
+        self.assertIs(results["runtime:xdg"].severity, Severity.OK)
+        self.assertIs(results["runtime:state"].severity, Severity.OK)
+        self.assertIn("will be created", results["runtime:state"].detail)
 
     def test_missing_runtime_is_fatal(self) -> None:
-        with (
-            mock.patch.object(checks, "RUNTIME", Path("/nonexistent/runtime")),
-            mock.patch.object(checks, "STATE_DIR", Path("/nonexistent/state")),
-            mock.patch.object(checks, "JOBS_DIR", Path("/nonexistent/jobs")),
-        ):
-            results = checks.check_runtime_directories()
-        by_name = {r.name: r for r in results}
-        self.assertIs(by_name["runtime:xdg"].severity, Severity.FATAL)
+        missing = Path("/nonexistent/runtime")
+        results = self._check(missing, missing / "state", xdg=str(missing))
+        self.assertIs(results["runtime:xdg"].severity, Severity.FATAL)
+
+    def test_unset_runtime_variable_is_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            results = self._check(runtime, runtime / "state", xdg=None)
+        self.assertIs(results["runtime:xdg"].severity, Severity.FATAL)
+        self.assertIn("XDG_RUNTIME_DIR is not set", results["runtime:xdg"].detail)
+
+    def test_private_state_directory_is_ok(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            state.mkdir(mode=0o700)
+            results = self._check(Path(temporary), state, xdg=temporary)
+        self.assertIs(results["runtime:state"].severity, Severity.OK)
+        self.assertIn("private permissions", results["runtime:state"].detail)
+
+    def test_shared_state_directory_is_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            state.mkdir()
+            state.chmod(0o750)
+            results = self._check(Path(temporary), state, xdg=temporary)
+        self.assertIs(results["runtime:state"].severity, Severity.WARNING)
+        self.assertIn("mode 750", results["runtime:state"].detail)
 
     def test_directory_owned_by_other_uid_is_warning(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / "state"
             state.mkdir(mode=0o700)
             fake_stat = mock.Mock(st_uid=999999, st_mode=0o040700)
             with mock.patch.object(Path, "stat", return_value=fake_stat):
-                result = checks._directory_result(
-                    "runtime:state", state, required=False
-                )
+                result = checks._directory_result("runtime:state", state)
         self.assertIs(result.severity, Severity.WARNING)
         self.assertIn("owned by uid", result.detail)
 
-
-class CursorJobTests(unittest.TestCase):
-    def _write(self, jobs_dir: Path, name: str, payload: dict[str, object]) -> None:
-        (jobs_dir / name).write_text(json.dumps(payload))
-
-    def test_no_store_is_ok(self) -> None:
-        with mock.patch.object(checks, "JOBS_DIR", Path("/nonexistent/jobs")):
-            results = checks.check_cursor_jobs()
-        self.assertIs(results[0].severity, Severity.OK)
-
-    def test_counts_and_flags_are_reported(self) -> None:
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as temporary:
-            jobs = Path(temporary)
-            self._write(jobs, "aaaaaaaaaaaa.json", {"status": "completed"})
-            self._write(jobs, "bbbbbbbbbbbb.json", {"status": "awaiting_user"})
-            self._write(
-                jobs,
-                "cccccccccccc.json",
-                {"status": "running", "updated_at": time.time() - 10_000},
-            )
-            (jobs / "dddddddddddd.json").write_text("{ not json")
-            quarantine = jobs / ".quarantine"
-            quarantine.mkdir()
-            (quarantine / "eeee-abc.metadata.json").write_text("{}")
-            with mock.patch.object(checks, "JOBS_DIR", jobs):
-                results = checks.check_cursor_jobs()
-        names = {r.name for r in results}
-        self.assertIn("jobs:store", names)
-        self.assertIn("jobs:attention", names)
-        self.assertIn("jobs:stuck", names)
-        self.assertIn("jobs:unreadable", names)
-        self.assertIn("jobs:quarantine", names)
-        quarantine_result = next(
-            result for result in results if result.name == "jobs:quarantine"
-        )
-        self.assertEqual(
-            quarantine_result.suggestion,
-            "voice-harness jobs quarantine list",
-        )
-
-    def test_reading_jobs_does_not_mutate_files(self) -> None:
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as temporary:
-            jobs = Path(temporary)
-            (jobs / "dddddddddddd.json").write_text("{ not valid json")
-            before = sorted(p.name for p in jobs.iterdir())
-            with mock.patch.object(checks, "JOBS_DIR", jobs):
-                checks.check_cursor_jobs()
-            after = sorted(p.name for p in jobs.iterdir())
-        self.assertEqual(before, after)
-
-    def test_sqlite_store_reports_path_schema_migration_and_integrity(self) -> None:
-        import tempfile
-
-        from local_voice_harness.cursor.model import CursorJob
-        from local_voice_harness.cursor.store import JobStore
-
-        with tempfile.TemporaryDirectory() as temporary:
-            jobs = Path(temporary) / "jobs"
-            store = JobStore(jobs, Path(temporary) / "legacy")
-            store.create(
-                CursorJob.from_dict(
-                    {
-                        "id": "123456789abc",
-                        "revision": 0,
-                        "request": "diagnose",
-                        "status": "queued",
-                        "created_at": 1,
-                        "queued_at": 1,
-                        "delivered": False,
-                    }
-                )
-            )
-            before = store.db_path.stat().st_mtime_ns
-            with mock.patch.object(checks, "JOBS_DIR", jobs):
-                results = checks.check_cursor_jobs()
-            after = store.db_path.stat().st_mtime_ns
-
-        database = next(result for result in results if result.name == "jobs:database")
-        self.assertIs(database.severity, Severity.OK)
-        self.assertIn(str(store.db_path), database.detail)
-        self.assertIn("schema=2", database.detail)
-        self.assertIn("migration=complete", database.detail)
-        self.assertIn("integrity=ok", database.detail)
-        self.assertEqual(after, before)
-
-    def test_sqlite_store_reports_missing_required_named_column_as_fatal(self) -> None:
-        import tempfile
-
-        from local_voice_harness.cursor.model import CursorJob
-        from local_voice_harness.cursor.store import JobStore
-
-        with tempfile.TemporaryDirectory() as temporary:
-            jobs = Path(temporary) / "jobs"
-            store = JobStore(jobs, Path(temporary) / "legacy")
-            store.create(
-                CursorJob.from_dict(
-                    {
-                        "id": "123456789abc",
-                        "revision": 0,
-                        "request": "diagnose missing schema",
-                        "status": "queued",
-                        "created_at": 1,
-                        "queued_at": 1,
-                        "delivered": False,
-                    }
-                )
-            )
-            with sqlite3.connect(store.db_path) as connection:
-                connection.execute(
-                    "ALTER TABLE job_identity "
-                    "DROP COLUMN grouped_repository_coordinator_id"
-                )
-
-            with mock.patch.object(checks, "JOBS_DIR", jobs):
-                results = checks.check_cursor_jobs()
-
-        self.assertEqual(len(results), 1)
-        database = results[0]
-        self.assertEqual(database.name, "jobs:database")
-        self.assertIs(database.severity, Severity.FATAL)
-        self.assertIn("named schema is incomplete", database.detail)
-        self.assertIn("job_identity.grouped_repository_coordinator_id", database.detail)
-
-
-class IntegrationCheckTests(unittest.TestCase):
-    def test_herdr_uses_configured_snapshot_client_and_path(self) -> None:
-        config = default_user_config()
-        configured = replace(
-            config,
-            platform=replace(config.platform, herdr_bin=Path("/opt/herdr")),
-        )
-        client = mock.Mock()
-        client.is_running.return_value = True
-        registry = replace(
-            checks.build_integration_registry(configured),
-            herdr_client=lambda: client,
-        )
-        snapshot = checks.DiagnosticSnapshot(configured, registry)
-
-        with mock.patch.object(checks, "_which", return_value="/opt/herdr") as which:
-            results = checks.check_herdr(snapshot)
-
-        which.assert_called_once_with("/opt/herdr")
-        client.is_running.assert_called_once_with()
-        self.assertIs(results[0].severity, Severity.OK)
-
-    def test_github_auth_uses_configured_executable_and_timeout(self) -> None:
-        config = default_user_config()
-        configured = replace(
-            config,
-            platform=replace(
-                config.platform,
-                gh_bin=Path("/opt/gh"),
-                github_timeout_seconds=17,
-            ),
-        )
-        snapshot = checks.DiagnosticSnapshot(
-            configured,
-            checks.build_integration_registry(configured),
-        )
+    def test_unreadable_directory_is_warning_with_redacted_detail(self) -> None:
         with (
-            mock.patch.object(checks, "_which", return_value="/opt/gh"),
+            mock.patch.object(Path, "exists", return_value=True),
             mock.patch.object(
-                checks, "_run", return_value=_completed(0, "logged in")
-            ) as run,
-        ):
-            results = checks.check_github_auth(snapshot)
-
-        run.assert_called_once_with(["/opt/gh", "auth", "status"], timeout=17)
-        self.assertIs(results[0].severity, Severity.OK)
-
-    def test_herdr_absent_binary_is_skipped(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value=None),
-            mock.patch.object(Path, "exists", return_value=False),
-        ):
-            self.assertEqual(checks.check_herdr(_snapshot()), [])
-
-    def test_herdr_running_is_ok(self) -> None:
-        snapshot = _snapshot()
-        client = mock.Mock()
-        client.is_running.return_value = True
-        assert snapshot.registry is not None
-        snapshot = replace(
-            snapshot,
-            registry=replace(snapshot.registry, herdr_client=lambda: client),
-        )
-        with mock.patch.object(checks, "_which", return_value="/usr/bin/herdr"):
-            results = checks.check_herdr(snapshot)
-        self.assertIs(results[0].severity, Severity.OK)
-
-    def test_herdr_stopped_is_warning(self) -> None:
-        snapshot = _snapshot()
-        client = mock.Mock()
-        client.is_running.return_value = False
-        assert snapshot.registry is not None
-        snapshot = replace(
-            snapshot,
-            registry=replace(snapshot.registry, herdr_client=lambda: client),
-        )
-        with mock.patch.object(checks, "_which", return_value="/usr/bin/herdr"):
-            results = checks.check_herdr(snapshot)
-        self.assertIs(results[0].severity, Severity.WARNING)
-
-    def test_herdr_error_is_warning(self) -> None:
-        snapshot = _snapshot()
-        client = mock.Mock()
-        client.is_running.side_effect = checks.HerdrError("bad")
-        assert snapshot.registry is not None
-        snapshot = replace(
-            snapshot,
-            registry=replace(snapshot.registry, herdr_client=lambda: client),
-        )
-        with mock.patch.object(checks, "_which", return_value="/usr/bin/herdr"):
-            results = checks.check_herdr(snapshot)
-        self.assertIs(results[0].severity, Severity.WARNING)
-
-    def test_cursor_cli_absent_is_skipped(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
-            self.assertEqual(checks.check_cursor_cli(), [])
-
-    def test_cursor_cli_ok(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/agent"),
-            mock.patch.object(checks, "_run", return_value=_completed(0, "1.2.3")),
-        ):
-            results = checks.check_cursor_cli()
-        self.assertIs(results[0].severity, Severity.OK)
-
-    def test_cursor_cli_failure_is_warning(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/agent"),
-            mock.patch.object(checks, "_run", return_value=_completed(1)),
-        ):
-            results = checks.check_cursor_cli()
-        self.assertIs(results[0].severity, Severity.WARNING)
-
-    def test_github_absent_is_skipped(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
-            self.assertEqual(checks.check_github_auth(), [])
-
-    def test_github_authenticated_is_ok(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/gh"),
-            mock.patch.object(checks, "_run", return_value=_completed(0, "logged in")),
-        ):
-            results = checks.check_github_auth()
-        self.assertIs(results[0].severity, Severity.OK)
-
-    def test_github_unauthenticated_is_warning(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/gh"),
-            mock.patch.object(checks, "_run", return_value=_completed(1)),
-        ):
-            results = checks.check_github_auth()
-        self.assertIs(results[0].severity, Severity.WARNING)
-        self.assertIn("gh auth login", results[0].suggestion or "")
-
-    def test_disabled_linear_has_no_diagnostic(self) -> None:
-        with mock.patch.object(checks, "capability_statuses", return_value=()):
-            self.assertEqual(checks.check_mcp_linear(), [])
-
-    def test_linear_mcp_configured_is_ok(self) -> None:
-        with mock.patch.object(
-            checks,
-            "capability_statuses",
-            return_value=(("linear", CapabilityStatus(True, "available")),),
-        ):
-            results = checks.check_mcp_linear()
-        self.assertIs(results[0].severity, Severity.OK)
-
-    def test_enabled_linear_missing_mcp_is_fatal_and_actionable(self) -> None:
-        with mock.patch.object(
-            checks,
-            "capability_statuses",
-            return_value=(
-                (
-                    "linear",
-                    CapabilityStatus(False, "cursor-mcp unavailable", "enable Linear"),
-                ),
+                Path, "stat", side_effect=PermissionError("token=supersecretvalue")
             ),
         ):
-            results = checks.check_mcp_linear()
-        self.assertIs(results[0].severity, Severity.FATAL)
-        self.assertEqual(results[0].suggestion, "enable Linear")
+            result = checks._directory_result("runtime:state", Path("/run/state"))
+        self.assertIs(result.severity, Severity.WARNING)
+        self.assertIn("could not stat", result.detail)
+        self.assertNotIn("supersecretvalue", result.detail)
 
 
-class CliWiringTests(unittest.TestCase):
-    def test_doctor_flags_parse(self) -> None:
-        parsed = cli.parser().parse_args(["doctor", "--json", "--fix"])
-        self.assertEqual(parsed.command, "doctor")
-        self.assertTrue(parsed.json_output)
-        self.assertTrue(parsed.fix)
+class ProcessCapabilityTests(unittest.TestCase):
+    def test_strong_process_ownership_is_ok(self) -> None:
+        with mock.patch.object(checks, "capability_diagnostics", return_value=[]):
+            results = checks.check_process_capabilities()
+        self.assertIs(results[0].severity, Severity.OK)
 
-    def test_doctor_defaults(self) -> None:
-        parsed = cli.parser().parse_args(["doctor"])
-        self.assertFalse(parsed.json_output)
-        self.assertFalse(parsed.fix)
+    def test_missing_process_capabilities_are_warnings(self) -> None:
+        issues = ["boot identity is unavailable", "pidfd_open is unavailable"]
+        with mock.patch.object(checks, "capability_diagnostics", return_value=issues):
+            results = checks.check_process_capabilities()
+        self.assertIs(results[0].severity, Severity.WARNING)
+        self.assertEqual(results[0].detail, "; ".join(issues))
 
-    def test_dispatch_invokes_doctor_and_exits_with_code(self) -> None:
-        parsed = cli.parser().parse_args(["doctor", "--json"])
-        with mock.patch.object(cli, "doctor", return_value=3) as doctor:
-            with self.assertRaises(SystemExit) as exited:
-                cli.dispatch(parsed)
-        doctor.assert_called_once_with(json_output=True, fix=False)
-        self.assertEqual(exited.exception.code, 3)
 
+class SmokeTests(unittest.TestCase):
     def test_all_checks_run_without_crashing(self) -> None:
         results = runner.run_diagnostics()
         self.assertTrue(results)
         self.assertFalse(
             any(r.category == "internal" for r in results),
-            "a real check crashed",
+            [r.detail for r in results if r.category == "internal"],
         )
 
 

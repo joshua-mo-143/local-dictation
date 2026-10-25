@@ -6,7 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from local_voice_harness.ipc import socket_ready, unix_request
+from local_dictation.ipc import socket_ready, unix_request
 
 
 def _server(path: Path) -> socket.socket:

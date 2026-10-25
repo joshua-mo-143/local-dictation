@@ -4,15 +4,14 @@ import subprocess
 import unittest
 from unittest import mock
 
-from local_voice_harness import notifications
-from local_voice_harness.notifications import NotificationResult, notify
+from local_dictation import notifications
+from local_dictation.notifications import NotificationResult, notify
 
 
 class NotificationTests(unittest.TestCase):
     def test_availability_requires_working_notification_service(self) -> None:
         with mock.patch.object(notifications.shutil, "which", return_value=None):
             self.assertFalse(notifications.notification_service_available())
-            self.assertFalse(notifications.NotifySendService().available())
         with (
             mock.patch.object(
                 notifications.shutil, "which", return_value="/usr/bin/notify-send"
@@ -42,7 +41,7 @@ class NotificationTests(unittest.TestCase):
         ):
             self.assertFalse(notifications.notification_service_available())
 
-    @mock.patch("local_voice_harness.notifications.subprocess.run")
+    @mock.patch("local_dictation.notifications.subprocess.run")
     def test_success_requires_zero_exit_status(self, run: mock.Mock) -> None:
         run.return_value = subprocess.CompletedProcess([], 0)
 
@@ -56,7 +55,7 @@ class NotificationTests(unittest.TestCase):
                 "normal",
                 "-t",
                 "5000",
-                "Voice harness",
+                "Dictation",
                 "Done",
             ],
             check=False,
@@ -64,13 +63,13 @@ class NotificationTests(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
 
-    @mock.patch("local_voice_harness.notifications.subprocess.run")
+    @mock.patch("local_dictation.notifications.subprocess.run")
     def test_nonzero_exit_status_is_failure(self, run: mock.Mock) -> None:
         run.return_value = subprocess.CompletedProcess([], 1)
 
         self.assertEqual(notify("No delivery"), NotificationResult.FAILED)
 
-    @mock.patch("local_voice_harness.notifications.subprocess.run")
+    @mock.patch("local_dictation.notifications.subprocess.run")
     def test_missing_executable_is_failure(self, run: mock.Mock) -> None:
         run.side_effect = FileNotFoundError("notify-send")
 

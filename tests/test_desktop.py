@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from local_voice_harness import desktop
+from local_dictation import desktop
 
 
 def completed(
@@ -84,7 +84,6 @@ class DesktopSelectionTests(unittest.TestCase):
         self.assertEqual(capabilities.name, "gnome")
         self.assertFalse(capabilities.active_window)
         self.assertFalse(capabilities.type_text)
-        self.assertFalse(capabilities.overlay)
         with self.assertRaisesRegex(desktop.DesktopError, "GNOME Wayland"):
             backend.type_text("hello")
 

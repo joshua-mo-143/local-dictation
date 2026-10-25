@@ -7,34 +7,42 @@ PROJECT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  scripts/dev.sh text <request>
-  scripts/dev.sh pronounce <text>
-  scripts/dev.sh wake
-  scripts/dev.sh setup [--defaults]
-  scripts/dev.sh config <show|set|reset> ...
-  scripts/dev.sh integrations <list|enable|disable|doctor> ...
+  scripts/dev.sh server
+  scripts/dev.sh dictate <command> [arguments...]
+
+Runs the STT server and the dictate client from this checkout with their own
+runtime directory, socket, configuration, and virtual environment. The
+installed local-dictation service is never started, stopped, or reconfigured.
+
+Environment:
+  DICTATION_DEV_EXTRA  engine extra for .dev/venv: cpu (default) or cuda
+  PYTHON_VERSION       Python for .dev/venv (default 3.11)
 EOF
 }
 
 command="${1:-}"
-python_version="3.11"
 case "$command" in
-  text|pronounce)
-    shift
-    if (($# == 0)); then
-      usage
-      exit 2
-    fi
-    ;;
-  wake)
+  server)
     shift
     if (($# != 0)); then
       usage
       exit 2
     fi
     ;;
-  setup|config|integrations)
+  dictate)
     shift
+    if (($# == 0)); then
+      usage
+      exit 2
+    fi
+    if [[ "$1" == "services" ]]; then
+      echo "scripts/dev.sh: the development launcher never manages the installed service" >&2
+      exit 2
+    fi
+    ;;
+  -h|--help)
+    usage
+    exit 0
     ;;
   *)
     usage
@@ -42,50 +50,30 @@ case "$command" in
     ;;
 esac
 
-if [[ -z "${GH_CONFIG_DIR:-}" ]]; then
-  export GH_CONFIG_DIR="${XDG_CONFIG_HOME:-"$HOME/.config"}/gh"
+extra="${DICTATION_DEV_EXTRA:-cpu}"
+if [[ "$extra" != cpu && "$extra" != cuda ]]; then
+  echo "scripts/dev.sh: DICTATION_DEV_EXTRA must be cpu or cuda" >&2
+  exit 2
 fi
+if [[ "${XDG_RUNTIME_DIR:-}" != /* ]]; then
+  echo "scripts/dev.sh: XDG_RUNTIME_DIR must be an absolute path" >&2
+  exit 1
+fi
+
+export DICTATION_RUNTIME_DIR="$XDG_RUNTIME_DIR/local-dictation-dev"
 export XDG_CONFIG_HOME="$PROJECT_DIR/.dev/config"
-export XDG_STATE_HOME="$PROJECT_DIR/.dev/state"
 export UV_PROJECT_ENVIRONMENT="$PROJECT_DIR/.dev/venv"
-export VOICE_HARNESS_BRANCH_RUNTIME="$PROJECT_DIR/.dev/runtime"
-export TMPDIR="$PROJECT_DIR/.dev/runtime/tmp"
-unset STATE_DIRECTORY
-mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$VOICE_HARNESS_BRANCH_RUNTIME" "$TMPDIR"
+mkdir -p -- "$XDG_CONFIG_HOME"
+(umask 077 && mkdir -p -- "$DICTATION_RUNTIME_DIR")
+chmod 700 -- "$DICTATION_RUNTIME_DIR"
 
-if [[ "$command" == "text" || "$command" == "pronounce" ]]; then
-  exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness "$command" "$@"
+uv_run=(
+  uv run
+  --project "$PROJECT_DIR"
+  --python "${PYTHON_VERSION:-3.11}"
+  --extra "$extra"
+)
+if [[ "$command" == server ]]; then
+  exec "${uv_run[@]}" local-dictation-server
 fi
-
-if [[ "$command" == "setup" || "$command" == "config" || "$command" == "integrations" ]]; then
-  exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness "$command" "$@"
-fi
-
-if systemctl --user is-active --quiet voice-harness-wake.service; then
-  cat >&2 <<'EOF'
-scripts/dev.sh: voice-harness-wake.service is active.
-Stop it manually before running the development wake listener:
-  systemctl --user stop voice-harness-wake.service
-Restore the installed listener after development:
-  systemctl --user start voice-harness-wake.service
-No services were changed.
-EOF
-  exit 1
-else
-  systemctl_status=$?
-fi
-
-if ((systemctl_status != 3 && systemctl_status != 4)); then
-  cat >&2 <<'EOF'
-scripts/dev.sh: unable to determine whether voice-harness-wake.service is active.
-Check the systemd user session and retry. No services were changed.
-EOF
-  exit 1
-fi
-
-uv run \
-  --project "$PROJECT_DIR" \
-  --python "$python_version" \
-  --extra wake \
-  python -m local_voice_harness.wake.models >/dev/null
-exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness-wake
+exec "${uv_run[@]}" dictate "$@"

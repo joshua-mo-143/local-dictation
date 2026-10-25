@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from local_voice_harness.coverage_gate import coverage_errors
+from local_dictation.coverage_gate import coverage_errors
 
 
 class CoverageGateTests(unittest.TestCase):

@@ -1,24 +1,18 @@
 from __future__ import annotations
 
-import contextlib
 import io
 import json
 import sys
 import tempfile
-import threading
-import time
 import unittest
 from contextlib import redirect_stdout
-from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness.errors import HarnessError
-from local_voice_harness.stt import client as stt_client
-from local_voice_harness.stt import server as stt_server
-from local_voice_harness.tts import client as tts_client
-from local_voice_harness.user_config import DictationDevice
-from tests.support import join_threads
+from local_dictation.errors import DictationError
+from local_dictation.stt import client as stt_client
+from local_dictation.stt import server as stt_server
+from local_dictation.user_config import ComputeDevice
 
 
 class SpeechToTextClientTests(unittest.TestCase):
@@ -69,7 +63,7 @@ class SpeechToTextClientTests(unittest.TestCase):
         instance.transcribe.return_value = " hello "
         settings = stt_server.STTRuntimeSettings(
             backend="parakeet",
-            device=DictationDevice.AUTO,
+            device=ComputeDevice.AUTO,
             model_name="nemo-parakeet-tdt-0.6b-v2",
             quantization="int8",
             compute_type="float16",
@@ -84,7 +78,7 @@ class SpeechToTextClientTests(unittest.TestCase):
 
         parakeet_cls.assert_called_once_with(
             "nemo-parakeet-tdt-0.6b-v2",
-            device=DictationDevice.AUTO,
+            device=ComputeDevice.AUTO,
             quantization="int8",
         )
         self.assertEqual(transcriber.transcribe("/tmp/audio.wav"), " hello ")
@@ -98,7 +92,7 @@ class SpeechToTextClientTests(unittest.TestCase):
         ):
             stt_server.ParakeetTranscriber(
                 "model",
-                device=DictationDevice.CPU,
+                device=ComputeDevice.CPU,
                 quantization="int8",
             )
 
@@ -121,7 +115,7 @@ class SpeechToTextClientTests(unittest.TestCase):
         ):
             stt_server.ParakeetTranscriber(
                 "model",
-                device=DictationDevice.CUDA,
+                device=ComputeDevice.CUDA,
                 quantization="int8",
             )
         onnx_asr.load_model.assert_not_called()
@@ -130,7 +124,7 @@ class SpeechToTextClientTests(unittest.TestCase):
         onnxruntime = mock.Mock()
         onnxruntime.get_available_providers.return_value = ["CPUExecutionProvider"]
         with mock.patch.dict(sys.modules, {"onnxruntime": onnxruntime}):
-            device, providers = stt_server._parakeet_device(DictationDevice.AUTO)
+            device, providers = stt_server._parakeet_device(ComputeDevice.AUTO)
 
         self.assertEqual(device, "cpu")
         self.assertEqual(providers, ["CPUExecutionProvider"])
@@ -142,7 +136,7 @@ class SpeechToTextClientTests(unittest.TestCase):
             "CPUExecutionProvider",
         ]
         with mock.patch.dict(sys.modules, {"onnxruntime": onnxruntime}):
-            device, providers = stt_server._parakeet_device(DictationDevice.CUDA)
+            device, providers = stt_server._parakeet_device(ComputeDevice.CUDA)
 
         self.assertEqual(device, "cuda")
         self.assertEqual(providers, ["CUDAExecutionProvider"])
@@ -154,7 +148,7 @@ class SpeechToTextClientTests(unittest.TestCase):
             "CPUExecutionProvider",
         ]
         with mock.patch.dict(sys.modules, {"onnxruntime": onnxruntime}):
-            device, providers = stt_server._parakeet_device(DictationDevice.AUTO)
+            device, providers = stt_server._parakeet_device(ComputeDevice.AUTO)
 
         self.assertEqual(device, "cuda")
         self.assertEqual(
@@ -171,7 +165,7 @@ class SpeechToTextClientTests(unittest.TestCase):
         ):
             stt_server.WhisperTranscriber(
                 "model",
-                device=DictationDevice.CPU,
+                device=ComputeDevice.CPU,
                 compute_type="float16",
                 language=None,
                 prompt="prompt",
@@ -189,13 +183,13 @@ class SpeechToTextClientTests(unittest.TestCase):
             mock.patch.dict(sys.modules, {"ctranslate2": ctranslate2}),
             self.assertRaisesRegex(RuntimeError, "CUDA dictation was requested"),
         ):
-            stt_server._whisper_device(DictationDevice.CUDA)
+            stt_server._whisper_device(ComputeDevice.CUDA)
 
     def test_whisper_auto_falls_back_to_cpu(self) -> None:
         ctranslate2 = mock.Mock()
         ctranslate2.get_cuda_device_count.return_value = 0
         with mock.patch.dict(sys.modules, {"ctranslate2": ctranslate2}):
-            device = stt_server._whisper_device(DictationDevice.AUTO)
+            device = stt_server._whisper_device(ComputeDevice.AUTO)
 
         self.assertEqual(device, "cpu")
 
@@ -256,7 +250,7 @@ class SpeechToTextClientTests(unittest.TestCase):
             with (
                 self.subTest(response=response),
                 mock.patch.object(stt_client, "_v2_request", return_value=response),
-                self.assertRaisesRegex(HarnessError, message),
+                self.assertRaisesRegex(DictationError, message),
             ):
                 stt_client.transcribe(Path("/runtime/recordings/request-test.wav"))
 
@@ -264,13 +258,13 @@ class SpeechToTextClientTests(unittest.TestCase):
             mock.patch.object(
                 stt_client, "_v2_request", side_effect=ConnectionRefusedError()
             ),
-            self.assertRaisesRegex(HarnessError, "STT request failed"),
+            self.assertRaisesRegex(DictationError, "STT request failed"),
         ):
             stt_client.transcribe(Path("/runtime/recordings/request-test.wav"))
 
     def test_transcribe_retries_busy_generation_then_succeeds(self) -> None:
         audio = Path(
-            "/runtime/voice-harness/recordings/"
+            "/runtime/local-dictation/recordings/"
             "request-0123456789abcdef0123456789abcdef.wav"
         )
         busy = {
@@ -304,23 +298,6 @@ class SpeechToTextClientTests(unittest.TestCase):
         )
         sleep.assert_called_once_with(stt_client.BUSY_BACKOFF_SECONDS)
 
-    def test_retained_transcribe_propagates_uncertain_ack_state(self) -> None:
-        response = {
-            "ok": True,
-            "version": stt_client.PROTOCOL_VERSION,
-            "type": "transcript",
-            "delivery_id": "delivery",
-            "text": "cancel that job",
-            "_retained_state": "uncertain",
-        }
-        with mock.patch.object(stt_client, "_v2_request", return_value=response):
-            delivery = stt_client.transcribe_retained(
-                Path("/runtime/request.wav"),
-                woke=False,
-            )
-
-        self.assertEqual(delivery.state, "uncertain")
-
     def test_transcribe_exhausted_busy_preserves_retry_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             audio = Path(temporary) / "request-generation.wav"
@@ -337,8 +314,8 @@ class SpeechToTextClientTests(unittest.TestCase):
                 mock.patch.object(stt_client, "REQUEST_DEADLINE_SECONDS", 0.0),
                 mock.patch.object(stt_client, "_v2_request", return_value=busy),
                 self.assertRaisesRegex(
-                    HarnessError,
-                    rf"voice-harness transcribe --generation {audio}",
+                    DictationError,
+                    rf"dictate retry {audio}",
                 ),
             ):
                 stt_client.transcribe(audio)
@@ -374,124 +351,6 @@ class SpeechToTextClientTests(unittest.TestCase):
                 "delivery_id": "delivery-id",
             },
         )
-
-    def test_retained_ack_records_wake_context_before_returning(self) -> None:
-        response = {
-            "ok": True,
-            "version": stt_client.PROTOCOL_VERSION,
-            "type": "transcript",
-            "delivery_id": "delivery-id",
-            "text": "do the thing",
-        }
-        connection = mock.Mock()
-        connection.recv.side_effect = [
-            json.dumps(response, separators=(",", ":")).encode() + b"\n",
-            b"",
-        ]
-        with (
-            mock.patch.object(stt_client.socket, "socket", return_value=connection),
-            mock.patch.object(stt_client, "_delivery_request") as delivery_request,
-        ):
-            result = stt_client._v2_request(
-                Path("/runtime/request.wav"),
-                timeout=3,
-                retain=True,
-                woke=True,
-            )
-
-        self.assertEqual(result["delivery_id"], response["delivery_id"])
-        self.assertEqual(result["text"], response["text"])
-        acknowledgment = json.loads(connection.sendall.call_args_list[1].args[0])
-        self.assertEqual(acknowledgment["disposition"], "retain")
-        self.assertIs(acknowledgment["woke"], True)
-        delivery_request.assert_called_once_with("pending", "delivery-id")
-        self.assertEqual(result["_retained_state"], "pending")
-
-    def test_pending_authorization_failure_remains_uncertain(self) -> None:
-        response = {
-            "ok": True,
-            "version": stt_client.PROTOCOL_VERSION,
-            "type": "transcript",
-            "delivery_id": "delivery-id",
-            "text": "do the thing",
-        }
-        connection = mock.Mock()
-        connection.recv.side_effect = [
-            json.dumps(response, separators=(",", ":")).encode() + b"\n",
-            b"",
-        ]
-        with (
-            mock.patch.object(stt_client.socket, "socket", return_value=connection),
-            mock.patch.object(
-                stt_client,
-                "_delivery_request",
-                side_effect=HarnessError("STT unavailable"),
-            ) as delivery_request,
-        ):
-            result = stt_client._v2_request(
-                Path("/runtime/request.wav"),
-                timeout=3,
-                retain=True,
-                woke=True,
-            )
-
-        delivery_request.assert_called_once_with("pending", "delivery-id")
-        self.assertEqual(result["_retained_state"], "uncertain")
-
-    def test_retained_ack_transport_failure_is_fenced_in_process(self) -> None:
-        response = {
-            "ok": True,
-            "version": stt_client.PROTOCOL_VERSION,
-            "type": "transcript",
-            "delivery_id": "delivery-id",
-            "text": "do the thing",
-        }
-        connection = mock.Mock()
-        connection.recv.side_effect = [
-            json.dumps(response, separators=(",", ":")).encode() + b"\n",
-            ConnectionResetError("reset after ack"),
-        ]
-        with (
-            mock.patch.object(stt_client.socket, "socket", return_value=connection),
-            mock.patch.object(stt_client, "_delivery_request") as delivery_request,
-        ):
-            result = stt_client._v2_request(
-                Path("/runtime/request.wav"),
-                timeout=3,
-                retain=True,
-            )
-
-        delivery_request.assert_called_once_with("ambiguous", "delivery-id")
-        self.assertEqual(result["_retained_state"], "ambiguous")
-
-    def test_retained_ack_transport_failure_surfaces_uncertain_recovery(self) -> None:
-        response = {
-            "ok": True,
-            "version": stt_client.PROTOCOL_VERSION,
-            "type": "transcript",
-            "delivery_id": "delivery-id",
-            "text": "do the thing",
-        }
-        connection = mock.Mock()
-        connection.recv.side_effect = [
-            json.dumps(response, separators=(",", ":")).encode() + b"\n",
-            ConnectionResetError("reset after ack"),
-        ]
-        with (
-            mock.patch.object(stt_client.socket, "socket", return_value=connection),
-            mock.patch.object(
-                stt_client,
-                "_delivery_request",
-                side_effect=HarnessError("STT unavailable"),
-            ),
-        ):
-            result = stt_client._v2_request(
-                Path("/runtime/request.wav"),
-                timeout=3,
-                retain=True,
-            )
-
-        self.assertEqual(result["_retained_state"], "uncertain")
 
     def test_transcribe_falls_back_to_legacy_server_once(self) -> None:
         audio = Path("/runtime/recordings/request.wav")
@@ -532,7 +391,7 @@ class SpeechToTextClientTests(unittest.TestCase):
         with (
             mock.patch.object(stt_client.socket, "socket", return_value=connection),
             mock.patch.object(stt_client, "unix_request") as legacy,
-            self.assertRaisesRegex(HarnessError, "invalid acknowledgment response"),
+            self.assertRaisesRegex(DictationError, "invalid acknowledgment response"),
         ):
             stt_client.transcribe(Path("/runtime/request.wav"))
 
@@ -551,7 +410,7 @@ class SpeechToTextClientTests(unittest.TestCase):
                 stt_client, "_v2_request", side_effect=stt_client._LegacyServer
             ),
             mock.patch.object(stt_client, "unix_request") as legacy,
-            self.assertRaisesRegex(HarnessError, "deadline expired"),
+            self.assertRaisesRegex(DictationError, "deadline expired"),
         ):
             stt_client.transcribe(audio)
 
@@ -573,8 +432,8 @@ class SpeechToTextClientTests(unittest.TestCase):
             with (
                 mock.patch.object(stt_client, "_v2_request", return_value=response),
                 self.assertRaisesRegex(
-                    HarnessError,
-                    rf"voice-harness transcribe --generation {audio}",
+                    DictationError,
+                    rf"dictate retry {audio}",
                 ),
             ):
                 stt_client.transcribe(audio)
@@ -582,132 +441,10 @@ class SpeechToTextClientTests(unittest.TestCase):
             audio.unlink()
             with (
                 mock.patch.object(stt_client, "_v2_request", return_value=response),
-                self.assertRaises(HarnessError) as caught,
+                self.assertRaises(DictationError) as caught,
             ):
                 stt_client.transcribe(audio)
-            self.assertNotIn("voice-harness transcribe", str(caught.exception))
-
-
-class TextToSpeechClientTests(unittest.TestCase):
-    def test_synthesize_sends_json_plays_output_and_returns_timings(self) -> None:
-        response = {
-            "ok": True,
-            "audio_seconds": 1.5,
-            "generation_seconds": 0.25,
-        }
-        output = io.StringIO()
-        with (
-            mock.patch.object(tts_client, "STATE_DIR", Path("/runtime")),
-            mock.patch.object(
-                tts_client, "unix_request", return_value=json.dumps(response).encode()
-            ) as request,
-            mock.patch.object(tts_client.subprocess, "run") as run,
-            mock.patch.object(
-                tts_client, "playback_slot", return_value=contextlib.nullcontext()
-            ),
-            mock.patch.object(
-                tts_client.time, "perf_counter", side_effect=[20.0, 20.125]
-            ),
-            mock.patch.object(
-                tts_client.uuid, "uuid4", return_value=mock.Mock(hex="request-id")
-            ),
-            redirect_stdout(output),
-        ):
-            settings = replace(
-                tts_client.default_user_config().audio,
-                voice="/tmp/voice.wav",
-                sink="usb-dac",
-            )
-            result = tts_client.synthesize_and_play("hello", settings)
-
-        payload = request.call_args.args[1]
-        self.assertTrue(payload.endswith(b"\n"))
-        self.assertEqual(
-            json.loads(payload),
-            {
-                "text": "hello",
-                "output": "/runtime/reply-request-id.wav",
-                "voice": "/tmp/voice.wav",
-            },
-        )
-        request.assert_called_once_with(tts_client.TTS_SOCKET, payload, timeout=120)
-        run.assert_called_once_with(
-            [
-                "pw-play",
-                "--target",
-                "usb-dac",
-                "/runtime/reply-request-id.wav",
-            ],
-            check=True,
-        )
-        self.assertEqual(result["stage"], "tts")
-        self.assertEqual(result["request_seconds"], 0.125)
-        self.assertEqual(json.loads(output.getvalue())["stage"], "tts")
-
-    def test_synthesize_reports_backend_failure_without_playing(self) -> None:
-        with (
-            mock.patch.object(
-                tts_client,
-                "unix_request",
-                return_value=b'{"ok": false, "error": "GPU unavailable"}',
-            ),
-            mock.patch.object(tts_client.subprocess, "run") as run,
-            self.assertRaisesRegex(HarnessError, "GPU unavailable"),
-        ):
-            tts_client.synthesize_and_play("hello")
-
-        run.assert_not_called()
-
-    def test_streaming_playback_is_serialized_across_callers(self) -> None:
-        active = 0
-        maximum_active = 0
-        state_lock = threading.Lock()
-
-        def run_playback(*, should_interrupt: object = None) -> dict[str, object]:
-            del should_interrupt
-            nonlocal active, maximum_active
-            with state_lock:
-                active += 1
-                maximum_active = max(maximum_active, active)
-            time.sleep(0.02)
-            with state_lock:
-                active -= 1
-            return {"ok": True}
-
-        playback = mock.Mock()
-        playback.run.side_effect = run_playback
-        with (
-            tempfile.TemporaryDirectory() as temporary,
-            mock.patch.object(tts_client, "STATE_DIR", Path(temporary)),
-            mock.patch.object(tts_client, "StreamingPlayback", return_value=playback),
-        ):
-            threads = [
-                threading.Thread(target=tts_client.stream_and_play, args=("hello",))
-                for _ in range(2)
-            ]
-            for thread in threads:
-                thread.start()
-            join_threads(threads)
-
-        self.assertEqual(maximum_active, 1)
-
-    def test_synthesize_rejects_malformed_responses(self) -> None:
-        for response in (b"not json", b"[]"):
-            with (
-                self.subTest(response=response),
-                mock.patch.object(tts_client, "unix_request", return_value=response),
-                self.assertRaisesRegex(HarnessError, "invalid response"),
-            ):
-                tts_client.synthesize_and_play("hello")
-
-    def test_synthesize_wraps_transport_errors(self) -> None:
-        with (
-            mock.patch.object(
-                tts_client, "unix_request", side_effect=ConnectionRefusedError()
-            ),
-            self.assertRaisesRegex(HarnessError, "TTS request failed"),
-        ):
-            tts_client.synthesize_and_play("hello")
+            self.assertNotIn("dictate retry", str(caught.exception))
 
 
 if __name__ == "__main__":

@@ -1,53 +1,82 @@
 # Service management
 
-The Python CLI is the user-facing service manager. Core orchestration talks to
-platform interfaces for user-service supervision, credential storage, and
-notifications. On Linux those interfaces are implemented by systemd user units,
-the desktop Secret Service (`secret-tool`), and `notify-send`. Systemd hardening
-and unit-audit logic stay inside that systemd implementation.
+`local-dictation.service` is a systemd user unit. systemd supervises the speech
+server, restarts it when it fails, and keeps its logs. `dictate services` wraps
+`systemctl --user` and `journalctl --user` for that one unit, and never touches
+any other unit.
 
-The Python CLI is the user-facing service manager; systemd remains responsible for
-process supervision, dependencies, restarts, and journal logs:
-
-```bash
-voice-harness services install
-voice-harness services start
-voice-harness services stop
-voice-harness services restart
-voice-harness services status
-voice-harness services audit
-voice-harness services logs
-voice-harness services logs --follow
-voice-harness services uninstall
+```fish
+dictate services install
+dictate services start
+dictate services status
+dictate services restart
+dictate services stop
+dictate services audit
+dictate services logs --follow
+dictate services uninstall
 ```
 
-`start` launches dictation and the wake listener. Qwen and Chatterbox remain
-on-demand. `stop` shuts down the wake listener, model servers, and dictation in a
-safe order but leaves Herdr and active Cursor agents running.
+| Command | What it does |
+| --- | --- |
+| `install [--force]` | Copies the shipped unit to `~/.config/systemd/user/`, reloads systemd, and enables the unit so it starts when you log in. If a different unit is already installed, it stops and asks for `--force` |
+| `start`, `stop`, `restart` | Starts, stops, or restarts the service. `stop` fails if the unit isn't installed |
+| `status` | Prints whether the service is active and enabled, such as `local-dictation.service: active (enabled)` |
+| `audit` | Checks the installed unit and the service's state without changing anything, and exits non-zero on any problem |
+| `logs [-f] [-n LINES]` | Shows the last 100 journal lines, or `LINES`, and keeps following with `-f` |
+| `uninstall` | Stops and disables the service, removes the unit file if it still matches the shipped one, and reloads systemd |
 
-Each management command resolves one validated `UserConfig` snapshot. Configured
-Herdr paths and timeouts are used by status and shutdown, while audits validate the
-effective units against the same snapshot. `restart` reuses one snapshot for its
-whole stop/start sequence: always-on services restart immediately, and active
-on-demand model services are stopped and pick up configuration on their next use.
-Changing from local to hosted providers still reports an active local model service
-for this stop-on-next-restart lifecycle.
+`uninstall` keeps a unit file you changed, and says so, so you can review it
+first. It also leaves your settings, vocabulary, service environment, and model
+cache in place.
 
-Stopping or uninstalling Herdr requires explicit confirmation through the option:
+## What the audit checks
 
-```bash
-voice-harness services stop --include-herdr
-voice-harness services uninstall --include-herdr
+`dictate services audit` reads the unit as systemd sees it, including any
+drop-ins, and checks that:
+
+- It runs `~/local-dictation/.venv-service/bin/local-dictation-server`, and that
+  file exists and is executable.
+- Its sandboxing, resource, and restart settings match the shipped values
+  exactly. Drop-ins that loosen or tighten them both fail; see
+  [Service hardening](service-hardening.md) for why.
+- It loads no `EnvironmentFile=`, and sets only the shipped environment
+  variables, with their shipped values.
+- It leaves devices unrestricted, because CUDA needs the NVIDIA device nodes,
+  and adds no `IPAddressDeny=` or `SystemCallFilter=`.
+- The service hasn't failed and isn't stuck in a restart loop.
+
+It also prints the device, backend, and model from your configuration, and the
+service's state, memory, and task count.
+
+## Restarts
+
+The service restarts 5 seconds after a failure, up to five starts a minute. Past
+that, systemd gives up and marks it failed until you start it again. If it
+refuses because the service started too often, clear the failure first:
+
+```fish
+systemctl --user reset-failed local-dictation.service
+dictate services start
 ```
 
-The small process launchers are Python. The `.service` files remain declarative
-systemd units rather than implementing a second process supervisor. They contain
-service-owned socket, cache, and runtime paths but no hard-coded provider, model,
-device, dictation, audio, integration, or platform choices. Those come from
-`config.toml` when each launcher starts. `backend.env` remains a read-only legacy
-resolver input; service installation and auditing never rewrite it.
+[Troubleshooting](troubleshooting.md#the-service-wont-start-or-keeps-restarting)
+covers finding the cause.
 
-All services use `Restart=on-failure` with a five-starts-per-minute rate limit.
-Audits report restart history for a healthy active service without treating that
-history alone as a crash loop; a service still activating or failed at the limit is
-unhealthy.
+## Configuration changes
+
+The service reads `config.toml` once, when it starts. After changing an `stt.*`
+setting, `dictation.prompt`, or `dictation.replacements`, run
+`dictate services restart`; `dictate config set` tells you when that's needed.
+See [When changes apply](configuration.md#when-changes-apply).
+
+The unit itself holds no engine, device, or audio choices, only the paths the
+service owns. Make those choices in `config.toml`, not in a drop-in: the
+audit rejects drop-ins that add environment variables.
+
+## Updates and drift
+
+When the shipped unit changes, `install` refuses to overwrite the old one until
+you've reviewed it. [Updating](installation.md#updating) covers the update
+steps, and
+[Troubleshooting](troubleshooting.md#the-installed-unit-drifted) covers
+replacing a unit that drifted.

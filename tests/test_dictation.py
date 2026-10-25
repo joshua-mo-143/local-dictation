@@ -9,85 +9,70 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import cli, config, dictation, recording
-from local_voice_harness.desktop import Window
-from local_voice_harness.errors import HarnessError, NoSpeechError
-from local_voice_harness.user_config import default_user_config
+from local_dictation import dictation
+from local_dictation.desktop import Window
+from local_dictation.errors import DictationError, NoSpeechError
+from local_dictation.user_config import default_user_config
 
 
 class DictationTests(unittest.TestCase):
-    def test_typed_dictation_uses_separate_audio_file(self) -> None:
-        self.assertNotEqual(dictation.WAV_PATH, config.WAV_PATH)
-
-    def test_cli_accepts_dictation_toggle(self) -> None:
-        arguments = cli.parser().parse_args(["dictate", "toggle"])
-        self.assertEqual(arguments.command, "dictate")
-        self.assertEqual(arguments.dictation_command, "toggle")
-
-    def test_cli_accepts_vad_dictation(self) -> None:
-        arguments = cli.parser().parse_args(["dictate", "vad"])
-        self.assertEqual(arguments.command, "dictate")
-        self.assertEqual(arguments.dictation_command, "vad")
-
-    def test_manual_end_passes_completed_generation_to_stt(self) -> None:
-        generation = Path("/runtime/voice-harness/recordings/request-generation.wav")
-        with (
-            mock.patch.object(cli, "stop_recording", return_value=generation),
-            mock.patch.object(cli, "transcribe", return_value="hello") as transcribe,
-            mock.patch.object(cli, "respond") as respond,
-        ):
-            cli.dispatch(cli.parser().parse_args(["end"]))
-
-        transcribe.assert_called_once_with(generation)
-        respond.assert_called_once_with("hello", user_config=mock.ANY)
-
-    def test_manual_transcribe_retries_explicit_pending_generation(self) -> None:
-        generation = Path(
-            "/runtime/voice-harness/recordings/"
-            "request-0123456789abcdef0123456789abcdef.wav"
-        )
-        with (
-            mock.patch.object(
-                cli, "retry_generation", return_value=generation
-            ) as retry,
-            mock.patch.object(cli, "transcribe", return_value="hello") as transcribe,
-            mock.patch.object(cli, "respond"),
-        ):
-            cli.dispatch(
-                cli.parser().parse_args(["transcribe", "--generation", str(generation)])
-            )
-
-        retry.assert_called_once_with(generation)
-        transcribe.assert_called_once_with(generation)
-
     def test_begin_starts_dictation_recording(self) -> None:
         with mock.patch.object(dictation, "start_recording") as start:
             dictation.run("begin")
         start.assert_called_once_with()
 
-    def test_manual_and_dictation_start_with_cross_mode_conflicts(self) -> None:
+    def test_start_records_from_configured_source(self) -> None:
+        settings = replace(default_user_config().dictation, source="usb-microphone")
         with (
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
-            mock.patch.object(dictation.recorder, "start_recording") as start_dictation,
+            mock.patch.object(dictation.recorder, "start_recording") as start,
             mock.patch.object(dictation, "notify"),
+            redirect_stdout(io.StringIO()),
         ):
-            dictation.start_recording()
-        self.assertEqual(
-            start_dictation.call_args.kwargs["conflicts"],
-            (dictation.MANUAL_PATHS,),
+            dictation.start_recording(settings)
+
+        start.assert_called_once_with(
+            dictation.PATHS, source="usb-microphone", ready=mock.ANY
         )
 
-        with (
-            mock.patch.object(recording.recorder, "start_recording") as start_manual,
-            mock.patch.object(recording, "notify"),
-        ):
-            audio = replace(default_user_config().audio, source="injected-microphone")
-            recording.start_recording(audio)
-        self.assertEqual(
-            start_manual.call_args.kwargs["conflicts"],
-            (recording.DICTATION_PATHS,),
+    def test_retry_transcribes_pending_generation_with_configured_injection(
+        self,
+    ) -> None:
+        generation = Path(
+            "/runtime/local-dictation/recordings/"
+            "recording-0123456789abcdef0123456789abcdef.wav"
         )
-        self.assertEqual(start_manual.call_args.kwargs["source"], "injected-microphone")
+        user_config = default_user_config()
+        with (
+            mock.patch.object(
+                dictation.recorder, "retry_generation", return_value=generation
+            ) as retry,
+            mock.patch.object(dictation, "_ensure_dictation_allowed") as allowed,
+            mock.patch.object(dictation, "transcribe_and_type") as transcribe,
+        ):
+            dictation.retry(generation, user_config)
+
+        retry.assert_called_once_with(
+            dictation.PATHS,
+            generation,
+            active_message="cannot retry while dictation is recording",
+        )
+        allowed.assert_called_once_with()
+        transcribe.assert_called_once_with(generation, user_config.dictation)
+
+    def test_retry_is_rejected_before_transcription_while_recording(self) -> None:
+        with (
+            mock.patch.object(
+                dictation.recorder,
+                "retry_generation",
+                side_effect=DictationError("cannot retry while dictation is recording"),
+            ),
+            mock.patch.object(dictation, "transcribe_and_type") as transcribe,
+            self.assertRaisesRegex(DictationError, "cannot retry"),
+        ):
+            dictation.retry(Path("/runtime/recording.wav"))
+
+        transcribe.assert_not_called()
 
     def test_toggle_starts_when_idle(self) -> None:
         with (
@@ -164,9 +149,7 @@ class DictationTests(unittest.TestCase):
         ):
             dictation.run("vad")
 
-        claim.assert_called_once_with(
-            dictation.PATHS, mode="vad", conflicts=(dictation.MANUAL_PATHS,)
-        )
+        claim.assert_called_once_with(dictation.PATHS, mode="vad")
         self.assertEqual(capture.call_args.kwargs["detector"], detector.return_value)
         complete.assert_called_once_with(
             dictation.PATHS,
@@ -237,7 +220,7 @@ class DictationTests(unittest.TestCase):
                 stop_requested = kwargs["stop_requested"]
                 assert isinstance(stop_requested, threading.Event)
                 stop_requested.set()
-                raise HarnessError("cancelled")
+                raise DictationError("cancelled")
 
             with (
                 mock.patch.object(dictation, "PATHS", paths),
@@ -310,7 +293,7 @@ class DictationTests(unittest.TestCase):
         )
         with (
             mock.patch.object(dictation, "get_desktop", return_value=desktop),
-            self.assertRaisesRegex(HarnessError, "disabled for RuneLite"),
+            self.assertRaisesRegex(DictationError, "disabled for RuneLite"),
         ):
             dictation.inject("buying fish")
 
@@ -322,7 +305,7 @@ class DictationTests(unittest.TestCase):
                 return_value=Window("1", "net-runelite-client-runelite", 10),
             ),
             mock.patch.object(dictation, "socket_ready") as socket_ready,
-            self.assertRaisesRegex(HarnessError, "disabled for RuneLite"),
+            self.assertRaisesRegex(DictationError, "disabled for RuneLite"),
         ):
             dictation.start_recording()
         socket_ready.assert_not_called()
@@ -341,7 +324,7 @@ class DictationTests(unittest.TestCase):
         settings = replace(default_user_config().dictation, inject="invalid")
         with (
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
-            self.assertRaises(HarnessError),
+            self.assertRaises(DictationError),
         ):
             dictation.inject("hello", settings)
 
@@ -358,7 +341,7 @@ class DictationTests(unittest.TestCase):
         desktop.active_window.return_value = Window("42", "firefox", 10)
         desktop.write_clipboard.return_value = False
         window = Window("42", "firefox", 10)
-        with self.assertRaisesRegex(HarnessError, "could not copy"):
+        with self.assertRaisesRegex(DictationError, "could not copy"):
             dictation._copy_to_clipboard(desktop, window, "hello")
 
     def test_auto_injection_pastes_after_copying_to_clipboard(self) -> None:
@@ -425,12 +408,12 @@ class DictationTests(unittest.TestCase):
             mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
             mock.patch.object(dictation, "get_desktop", return_value=None),
-            self.assertRaisesRegex(HarnessError, "Hyprland, and Sway"),
+            self.assertRaisesRegex(DictationError, "Hyprland, and Sway"),
         ):
             dictation.inject("hello")
 
     def test_gnome_wayland_reports_capability_degradation(self) -> None:
-        from local_voice_harness.desktop import DegradedWaylandDesktop
+        from local_dictation.desktop import DegradedWaylandDesktop
 
         backend = DegradedWaylandDesktop(
             "gnome",
@@ -441,7 +424,7 @@ class DictationTests(unittest.TestCase):
             mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
             mock.patch.object(dictation, "get_desktop", return_value=backend),
-            self.assertRaisesRegex(HarnessError, "GNOME Wayland"),
+            self.assertRaisesRegex(DictationError, "GNOME Wayland"),
         ):
             dictation.inject("hello")
 
@@ -471,7 +454,7 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
             mock.patch.object(dictation, "get_desktop", return_value=desktop),
             mock.patch.object(dictation, "_send_key") as send_key,
-            self.assertRaisesRegex(HarnessError, "focused window changed"),
+            self.assertRaisesRegex(DictationError, "focused window changed"),
         ):
             dictation.inject("hello")
         desktop.write_clipboard.assert_not_called()
@@ -495,7 +478,7 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
             mock.patch.object(dictation, "get_desktop", return_value=desktop),
             mock.patch.object(dictation.time, "sleep"),
-            self.assertRaisesRegex(HarnessError, "focused window changed"),
+            self.assertRaisesRegex(DictationError, "focused window changed"),
         ):
             dictation.inject("hello")
 
@@ -514,7 +497,7 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
             mock.patch.object(dictation, "get_desktop", return_value=desktop),
             mock.patch.object(dictation.time, "sleep"),
-            self.assertRaisesRegex(HarnessError, "focused window changed"),
+            self.assertRaisesRegex(DictationError, "focused window changed"),
         ):
             dictation.inject("hello")
         desktop.type_text.assert_not_called()
@@ -532,7 +515,7 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
             mock.patch.object(dictation, "get_desktop", return_value=desktop),
             mock.patch.object(dictation.time, "sleep"),
-            self.assertRaisesRegex(HarnessError, "focused window changed"),
+            self.assertRaisesRegex(DictationError, "focused window changed"),
         ):
             dictation.inject("buying fish")
         desktop.send_key.assert_not_called()

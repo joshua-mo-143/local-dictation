@@ -5,22 +5,26 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import production_extras
-from local_voice_harness.config import PROJECT_ROOT
+from local_dictation import production_extras
+from local_dictation.config import PROJECT_ROOT
 
 
 class ProductionExtraSpecTests(unittest.TestCase):
     def test_every_declared_extra_has_an_install_and_entry_point_spec(self) -> None:
         pyproject = PROJECT_ROOT / "pyproject.toml"
         extras = production_extras.declared_extras(pyproject)
+        self.assertEqual(extras, ("cpu", "cuda", "whisper"))
         self.assertEqual(extras, tuple(sorted(production_extras.EXTRA_SPECS)))
         self.assertEqual(production_extras.missing_extra_specs(pyproject), ())
         for extra, spec in production_extras.EXTRA_SPECS.items():
             with self.subTest(extra=extra):
                 self.assertTrue(spec.imports)
-                self.assertTrue(spec.commands)
+                self.assertEqual(
+                    spec.commands, (("local-dictation-server", ("--check",)),)
+                )
 
-    def test_core_and_extra_commands_use_check_or_help_without_model_load(self) -> None:
+    def test_core_runs_dictate_help_and_extras_avoid_model_loads(self) -> None:
+        self.assertEqual(production_extras.CORE_COMMANDS, (("dictate", ("--help",)),))
         for name, arguments in (
             *production_extras.CORE_COMMANDS,
             *(
@@ -32,16 +36,23 @@ class ProductionExtraSpecTests(unittest.TestCase):
             with self.subTest(entry_point=name):
                 self.assertIn(arguments[0], {"--check", "--help"})
 
+    def test_cuda_extra_must_resolve_the_gpu_runtime(self) -> None:
+        self.assertEqual(
+            production_extras.EXTRA_SPECS["cuda"].required_distributions,
+            ("onnxruntime-gpu",),
+        )
+        self.assertIn("onnxruntime", production_extras.EXTRA_SPECS["cpu"].imports)
+
 
 class ProductionExtraCommandTests(unittest.TestCase):
     def test_export_and_install_commands_keep_extras_in_separate_environments(
         self,
     ) -> None:
-        wheel = Path("/tmp/local_voice_harness-0.1.0-py3-none-any.whl")
-        python = Path("/tmp/extra-wake/bin/python")
-        requirements = Path("/tmp/wake.txt")
+        wheel = Path("/tmp/local_dictation-0.1.0-py3-none-any.whl")
+        python = Path("/tmp/extra-cpu/bin/python")
+        requirements = Path("/tmp/cpu.txt")
         self.assertEqual(
-            production_extras.export_command("wake"),
+            production_extras.export_command("cpu"),
             [
                 "uv",
                 "export",
@@ -49,7 +60,7 @@ class ProductionExtraCommandTests(unittest.TestCase):
                 "--no-dev",
                 "--no-emit-project",
                 "--extra",
-                "wake",
+                "cpu",
             ],
         )
         self.assertEqual(
@@ -68,8 +79,8 @@ class ProductionExtraCommandTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            production_extras.import_command(python, ("openwakeword", "numpy")),
-            [str(python), "-c", "import openwakeword; import numpy"],
+            production_extras.import_command(python, ("onnx_asr", "onnxruntime")),
+            [str(python), "-c", "import onnx_asr; import onnxruntime"],
         )
         self.assertEqual(
             production_extras.show_distribution_command(python, "onnxruntime-gpu"),
@@ -77,15 +88,19 @@ class ProductionExtraCommandTests(unittest.TestCase):
         )
 
     def test_unknown_extra_fails_before_installing(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaises(SystemExit) as raised:
-                production_extras.check_environments(
-                    project=PROJECT_ROOT,
-                    python="3.11",
-                    extras=("not-an-extra",),
-                    work=Path(temporary),
-                )
-        self.assertIn("no extra spec", str(raised.exception))
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(production_extras, "_run") as run,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            production_extras.check_environments(
+                project=PROJECT_ROOT,
+                python="3.11",
+                extras=("dictation",),
+                work=Path(temporary),
+            )
+        self.assertIn("no extra spec for dictation", str(raised.exception))
+        run.assert_not_called()
 
     def test_check_environments_installs_core_then_each_extra(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -103,33 +118,73 @@ class ProductionExtraCommandTests(unittest.TestCase):
                 if command[:2] == ["uv", "venv"]:
                     destination = Path(command[-1])
                     (destination / "bin").mkdir(parents=True)
-                    (destination / "bin" / "python").write_text("python")
-                    for name, _arguments in (
-                        *production_extras.CORE_COMMANDS,
-                        *production_extras.EXTRA_SPECS["wake"].commands,
-                    ):
+                    for name in ("python", "dictate", "local-dictation-server"):
                         (destination / "bin" / name).write_text(name)
                 return mock.Mock(returncode=0, stdout="", stderr="")
 
-            with mock.patch.object(production_extras, "_run", side_effect=fake_run):
+            with (
+                mock.patch.object(production_extras, "_run", side_effect=fake_run),
+                mock.patch("builtins.print"),
+            ):
                 production_extras.check_environments(
                     project=PROJECT_ROOT,
                     python="3.11",
-                    extras=("wake",),
+                    extras=("cpu", "cuda"),
                     work=work,
                 )
 
         exported = [command for command in recorded if command[:2] == ["uv", "export"]]
         self.assertEqual(exported[0][-2:], ["-o", str(work / "core.txt")])
-        self.assertIn("--extra", exported[1])
-        self.assertIn("wake", exported[1])
-        self.assertTrue(any("voice-harness-wake" in command[0] for command in recorded))
-        self.assertTrue(
-            any(
-                command[-1] == "import openwakeword; import numpy"
-                for command in recorded
+        self.assertEqual(exported[1][-4:-2], ["--extra", "cpu"])
+        self.assertEqual(exported[2][-4:-2], ["--extra", "cuda"])
+        self.assertIn([str(work / "core/bin/dictate"), "--help"], recorded)
+        for extra in ("cpu", "cuda"):
+            self.assertIn(
+                [str(work / extra / "bin/local-dictation-server"), "--check"],
+                recorded,
             )
+        self.assertIn(
+            [
+                str(work / "cpu/bin/python"),
+                "-c",
+                "import onnx_asr; import onnxruntime; import huggingface_hub",
+            ],
+            recorded,
         )
+        self.assertIn(
+            production_extras.show_distribution_command(
+                work / "cuda/bin/python", "onnxruntime-gpu"
+            ),
+            recorded,
+        )
+
+    def test_missing_entry_point_fails_the_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            venv = Path(temporary)
+            (venv / "bin").mkdir()
+            with self.assertRaises(SystemExit) as raised:
+                production_extras._check_commands(
+                    venv, production_extras.EXTRA_SPECS["cpu"].commands
+                )
+        self.assertIn("local-dictation-server is missing", str(raised.exception))
+
+    def test_main_uses_a_local_dictation_scratch_directory(self) -> None:
+        with (
+            mock.patch.object(
+                production_extras.tempfile,
+                "TemporaryDirectory",
+                wraps=tempfile.TemporaryDirectory,
+            ) as temporary,
+            mock.patch.object(production_extras, "check_environments") as check,
+        ):
+            result = production_extras.main(["--python", "3.11", "--extra", "cpu"])
+
+        self.assertEqual(result, 0)
+        self.assertTrue(
+            temporary.call_args.kwargs["prefix"].startswith("local-dictation-")
+        )
+        self.assertEqual(check.call_args.kwargs["extras"], ("cpu",))
+        self.assertEqual(check.call_args.kwargs["python"], "3.11")
 
 
 if __name__ == "__main__":

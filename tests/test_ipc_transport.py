@@ -4,7 +4,7 @@ import socket
 import time
 import unittest
 
-from local_voice_harness.ipc import unix_request
+from local_dictation.ipc import unix_request
 from tests.support import UnixSocketServer, receive_all
 
 
