@@ -1,0 +1,191 @@
+# Opt-in hardware smoke checks
+
+These checks are manual and intentionally excluded from CI. They start local services,
+load GPU models, use the microphone and speakers, and may start a Herdr-managed Cursor
+agent. Run only the section whose side effects you intend, on the target workstation.
+
+Before starting, install the project and services as described in the README. Open a
+second terminal for logs and keep `voice-harness services stop` available for cleanup.
+
+## PipeWire capture and playback
+
+Entry point:
+
+```bash
+wpctl status
+pw-record --version
+pw-play --version
+voice-harness begin
+# Speak a short sentence.
+voice-harness end
+```
+
+Checklist:
+
+- The configured source appears in `wpctl status`.
+- `begin` starts capture without an immediate PipeWire error.
+- `end` stops capture and reaches transcription.
+- A spoken response is audible on the intended sink, without overlap or truncation.
+- `journalctl --user -u voice-harness-wake.service -n 50` has no device errors.
+
+If `end` or transcription fails, cancel any surviving recording before retrying.
+Then stop services started by the turn:
+
+```bash
+voice-harness cancel
+voice-harness services stop
+```
+
+## Speaker-to-microphone leakage
+
+This check must use the wake daemon so it can associate captured speech with its own
+recent playback. Start the services, follow the wake log in a second terminal, and
+temporarily avoid headphones:
+
+```bash
+voice-harness services start
+journalctl --user -u voice-harness-wake.service -f
+voice-harness listen
+# Say: Say exactly, tomorrow is another day.
+```
+
+Remain silent through playback and for ten seconds afterward. Then repeat the request
+and say “Hey Jarvis, stop” while the response is still playing.
+
+Checklist:
+
+- Audible speaker output leaks into the configured microphone at the normal test
+  volume.
+- Silence after playback does not produce a `You:` turn or another assistant reply.
+- If STT recognizes the leaked response, the log says the follow-up matched recent
+  local playback.
+- The wake-word interruption still cancels playback and admits “stop” as user speech.
+- An ordinary, differently worded follow-up immediately after playback is admitted.
+- After ten seconds, repeating words from the response is no longer rejected solely
+  as recent playback.
+
+Clean up:
+
+```bash
+voice-harness services stop
+```
+
+## CUDA model loading
+
+Entry point:
+
+```bash
+nvidia-smi
+llama-server --list-devices
+systemctl --user start dictation.service voice-harness-llm.service voice-harness-tts.service
+systemctl --user is-active dictation.service voice-harness-llm.service voice-harness-tts.service
+curl --fail http://127.0.0.1:8090/health
+journalctl --user -u dictation.service -u voice-harness-llm.service -u voice-harness-tts.service -n 100
+```
+
+Checklist:
+
+- `llama-server` lists the CUDA device configured in the LLM unit.
+- All three services remain active after their models load.
+- The llama.cpp health endpoint succeeds.
+- Logs identify CUDA providers/devices and contain no CPU fallback, missing model, or
+  out-of-memory error.
+- `nvidia-smi` shows the expected model processes and plausible VRAM use.
+
+Stop every service started by this isolated check:
+
+```bash
+systemctl --user stop voice-harness-tts.service voice-harness-llm.service dictation.service
+```
+
+## Herdr and Cursor handoff
+
+This check starts or reuses a Cursor agent but should not ask it to modify files.
+
+Entry point:
+
+```bash
+herdr status server
+herdr agent list
+voice-harness text "Use Cursor to inspect this repository and report its current branch without changing anything."
+herdr agent list
+```
+
+Checklist:
+
+- Herdr reports a running server.
+- The request selects the intended checkout.
+- Exactly one suitable agent handles the request.
+- The result returns to the harness and no repository files change.
+- `voice-harness status` shows no abandoned running job.
+
+Stop any voice services activated while delivering the result. Herdr and its retained
+agent are intentionally left running for inspection:
+
+```bash
+voice-harness services stop
+```
+
+## Durable job recovery across reboot
+
+Use a harmless Cursor request that remains active beyond the foreground timeout.
+Record its ID, then reboot the workstation rather than manually copying state:
+
+```bash
+state_home="$HOME/.local/state/voice-harness"
+if [[ -n ${STATE_DIRECTORY:-} ]]; then
+  IFS=: read -ra candidates <<<"$STATE_DIRECTORY"
+  for candidate in "${candidates[@]}"; do
+    if [[ $candidate == /*/voice-harness ]]; then
+      state_home=$candidate
+      break
+    fi
+  done
+elif [[ -n ${XDG_STATE_HOME:-} ]]; then
+  state_home="$XDG_STATE_HOME/voice-harness"
+fi
+voice-harness text "Use Cursor to inspect this repository and wait for my next instruction without changing files."
+ls "$state_home/jobs"
+# Reboot, sign back in, and start the wake service before continuing.
+systemctl --user start voice-harness-wake.service
+voice-harness status
+ls "$XDG_RUNTIME_DIR/voice-harness/jobs"
+```
+
+Checklist:
+
+- `jobs/jobs.sqlite3` survives under the state directory and no active job JSON is
+  recreated in the runtime jobs directory.
+- Recovery does not accept the pre-reboot PID/start-time ownership; it safely resumes
+  or reconciles the job.
+- Old worker logs do not survive the reboot or migrate into durable storage.
+- A delivered terminal fixture older than seven days is pruned, while undelivered,
+  uncertain, manual-review, and quarantine evidence remains.
+
+## End-to-end voice turn
+
+Start from stopped on-demand models so this check includes service activation:
+
+```bash
+voice-harness services start
+voice-harness services status
+```
+
+Say “Hey Jarvis, what time is it?” and wait for playback.
+
+Checklist:
+
+- Wake detection activates once.
+- Capture stops after the utterance and produces a non-empty transcription.
+- Dictation, LLM, and TTS become ready without manual intervention.
+- The response begins playing and the complete turn is audible.
+- A second ordinary turn succeeds with warm models.
+- Saying the wake phrase during playback cancels that playback and begins a new turn.
+- Service logs contain no traceback, stale socket, orphan process, or repeated restart.
+
+Clean up:
+
+```bash
+voice-harness services stop
+voice-harness services status
+```
