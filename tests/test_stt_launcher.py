@@ -36,8 +36,21 @@ class ProtectedEnvironmentTests(unittest.TestCase):
                 "HOME": "/home/example",
                 "XDG_CACHE_HOME": "/home/example/.cache",
                 "XDG_RUNTIME_DIR": "/run/user/1000",
+                "ORT_DISABLE_TELEMETRY": "1",
             },
         )
+
+    def test_onnx_runtime_telemetry_stays_off_when_the_caller_enables_it(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            launcher.pwd, "getpwuid", return_value=_passwd(Path("/home/example"))
+        ):
+            environment = launcher.protected_environment(
+                {"ORT_DISABLE_TELEMETRY": "0"}, uid=1000
+            )
+
+        self.assertEqual(environment["ORT_DISABLE_TELEMETRY"], "1")
 
     def test_development_runtime_override_moves_scratch_paths(self) -> None:
         with mock.patch.object(

@@ -46,11 +46,12 @@ manager. The checks reject them so they don't creep in by accident.
 
 ## Environment
 
-The unit sets only `CUDA_CACHE_PATH`, `HF_HOME`, and `TMPDIR`. The launcher
-forces the same values, along with `HOME`, `XDG_CACHE_HOME`, and
-`XDG_RUNTIME_DIR`, so the service's paths can't be redirected through the
-environment. It loads no `EnvironmentFile=`. Engine, device, and audio choices
-live in `config.toml`, never in the unit.
+The unit sets only `CUDA_CACHE_PATH`, `HF_HOME`, and `TMPDIR`, and loads no
+`EnvironmentFile=`. The launcher forces the same values, along with `HOME`,
+`XDG_CACHE_HOME`, and `XDG_RUNTIME_DIR`, so the service's paths can't be
+redirected through the environment. It also forces `ORT_DISABLE_TELEMETRY=1`,
+which keeps ONNX Runtime from collecting telemetry. Engine, device, and audio
+choices live in `config.toml`, never in the unit.
 
 ## How it's enforced
 

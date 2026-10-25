@@ -158,6 +158,55 @@ class ProductionExtraCommandTests(unittest.TestCase):
             recorded,
         )
 
+    def test_imports_run_with_telemetry_off_in_scratch_directories(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.dict(
+                production_extras.os.environ,
+                {
+                    "HOME": "/home/example",
+                    "XDG_CACHE_HOME": "/home/example/.cache",
+                    "XDG_CONFIG_HOME": "/home/example/.config",
+                    "ORT_DISABLE_TELEMETRY": "0",
+                    "PATH": "/usr/bin",
+                },
+                clear=True,
+            ),
+            mock.patch.object(production_extras, "_run") as run,
+        ):
+            scratch = Path(temporary) / "cpu-imports"
+            python = Path("/tmp/extra-cpu/bin/python")
+            production_extras._check_imports(python, ("onnxruntime",), scratch)
+
+        run.assert_called_once_with(
+            [str(python), "-c", "import onnxruntime"],
+            env={
+                "ORT_DISABLE_TELEMETRY": "1",
+                "PATH": "/usr/bin",
+                "HOME": str(scratch / "home"),
+                "TMPDIR": str(scratch / "tmp"),
+            },
+        )
+
+    def test_imports_that_leave_files_behind_fail_the_check(self) -> None:
+        def write_device_id(_command: list[str], *, env: dict[str, str]) -> None:
+            state = Path(env["HOME"]) / ".cache/Microsoft"
+            state.mkdir(parents=True)
+            (state / "deviceid").write_text("id")
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(production_extras, "_run", side_effect=write_device_id),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            production_extras._check_imports(
+                Path("/tmp/python"), ("onnxruntime",), Path(temporary) / "scratch"
+            )
+
+        message = str(raised.exception)
+        self.assertIn("importing onnxruntime wrote", message)
+        self.assertIn("home/.cache/Microsoft/deviceid", message)
+
     def test_missing_entry_point_fails_the_check(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             venv = Path(temporary)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import PROJECT_ROOT
+from .stt.launcher import TELEMETRY_OPT_OUTS
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,20 @@ def import_command(python_bin: Path, modules: Sequence[str]) -> list[str]:
     return [str(python_bin), "-c", statement]
 
 
+def import_environment(home: Path, temporary: Path) -> dict[str, str]:
+    """Opt out of telemetry and point every per-user directory at scratch space."""
+
+    inherited = {
+        key: value for key, value in os.environ.items() if not key.startswith("XDG_")
+    }
+    return {
+        **inherited,
+        **TELEMETRY_OPT_OUTS,
+        "HOME": str(home),
+        "TMPDIR": str(temporary),
+    }
+
+
 def _run(
     command: Sequence[str],
     *,
@@ -173,6 +189,24 @@ def _check_commands(
         _run([str(executable), *arguments])
 
 
+def _check_imports(python_bin: Path, modules: Sequence[str], scratch: Path) -> None:
+    home = scratch / "home"
+    temporary = scratch / "tmp"
+    home.mkdir(parents=True)
+    temporary.mkdir()
+    _run(import_command(python_bin, modules), env=import_environment(home, temporary))
+    written = sorted(
+        str(path.relative_to(scratch))
+        for path in scratch.rglob("*")
+        if path not in (home, temporary)
+    )
+    if written:
+        raise SystemExit(
+            f"error: importing {', '.join(modules)} wrote {', '.join(written)}; "
+            "a dependency may have started keeping telemetry state"
+        )
+
+
 def show_distribution_command(python_bin: Path, name: str) -> list[str]:
     return ["uv", "pip", "show", "--python", str(python_bin), name]
 
@@ -214,7 +248,7 @@ def check_environments(
         destination=core,
         project=project,
     )
-    _run(import_command(core_python, ("local_dictation",)))
+    _check_imports(core_python, ("local_dictation",), work / "core-imports")
     _check_commands(core, CORE_COMMANDS)
     print("core wheel entry points ok")
 
@@ -228,7 +262,7 @@ def check_environments(
             destination=environment,
             project=project,
         )
-        _run(import_command(python_bin, spec.imports))
+        _check_imports(python_bin, spec.imports, work / f"{extra}-imports")
         _check_distributions(python_bin, spec.required_distributions)
         _check_commands(environment, spec.commands)
         print(f"{extra} extra entry points ok")

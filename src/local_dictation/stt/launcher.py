@@ -10,6 +10,10 @@ from pathlib import Path
 from .. import config
 from ..user_config import ComputeDevice, load_user_config
 
+# Recent ONNX Runtime releases keep a device ID and upload usage events from
+# Linux unless this is "1".
+TELEMETRY_OPT_OUTS: Mapping[str, str] = {"ORT_DISABLE_TELEMETRY": "1"}
+
 PROTECTED_ENVIRONMENT_KEYS = frozenset(
     {
         "CUDA_CACHE_PATH",
@@ -18,6 +22,7 @@ PROTECTED_ENVIRONMENT_KEYS = frozenset(
         "HOME",
         "XDG_CACHE_HOME",
         "XDG_RUNTIME_DIR",
+        *TELEMETRY_OPT_OUTS,
     }
 )
 
@@ -27,7 +32,7 @@ def protected_environment(
     *,
     uid: int | None = None,
 ) -> dict[str, str]:
-    """Return service-owned paths that user configuration cannot replace."""
+    """Return service-owned settings that user configuration cannot replace."""
 
     resolved_uid = os.getuid() if uid is None else uid
     home = Path(pwd.getpwuid(resolved_uid).pw_dir)
@@ -40,6 +45,7 @@ def protected_environment(
         "HOME": str(home),
         "XDG_CACHE_HOME": str(home / ".cache"),
         "XDG_RUNTIME_DIR": str(runtime),
+        **TELEMETRY_OPT_OUTS,
     }
 
 
