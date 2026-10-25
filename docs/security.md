@@ -4,9 +4,10 @@
   never leave the machine. Models download once from Hugging Face into
   `~/.cache/huggingface`.
 - Recent ONNX Runtime releases keep a device ID and upload usage events to
-  Microsoft. The server launcher sets `ORT_DISABLE_TELEMETRY=1` to turn that
-  off, and the production-extras check in CI fails if importing an engine
-  writes anything to the home, cache, or temporary directory.
+  Microsoft. The server launcher and `dictate vad` set `ORT_DISABLE_TELEMETRY=1`
+  before loading ONNX Runtime to turn that off, and the production-extras check
+  in CI fails if importing an engine or running the VAD writes anything to the
+  home, cache, or temporary directory.
 - Transcription can be wrong, and dictated text goes straight into the focused
   window. Check what was typed before you press <kbd>Enter</kbd> in a terminal.
 - Recordings, recorder ownership, logs, and the service socket are session data

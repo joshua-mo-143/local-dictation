@@ -9,12 +9,13 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 from .config import PROJECT_ROOT
-from .stt.launcher import TELEMETRY_OPT_OUTS
+from .telemetry import TELEMETRY_OPT_OUTS
 
 
 @dataclass(frozen=True)
@@ -107,18 +108,30 @@ def import_command(python_bin: Path, modules: Sequence[str]) -> list[str]:
     return [str(python_bin), "-c", statement]
 
 
-def import_environment(home: Path, temporary: Path) -> dict[str, str]:
-    """Opt out of telemetry and point every per-user directory at scratch space."""
+def vad_check_command(python_bin: Path) -> list[str]:
+    return [str(python_bin), "-m", "local_dictation.vad", "--check"]
 
+
+def _scratch_environment(home: Path, temporary: Path) -> dict[str, str]:
     inherited = {
         key: value for key, value in os.environ.items() if not key.startswith("XDG_")
     }
-    return {
-        **inherited,
-        **TELEMETRY_OPT_OUTS,
-        "HOME": str(home),
-        "TMPDIR": str(temporary),
-    }
+    return {**inherited, "HOME": str(home), "TMPDIR": str(temporary)}
+
+
+def import_environment(home: Path, temporary: Path) -> dict[str, str]:
+    """Opt out of telemetry and point every per-user directory at scratch space."""
+
+    return {**_scratch_environment(home, temporary), **TELEMETRY_OPT_OUTS}
+
+
+def vad_environment(home: Path, temporary: Path, models: Path) -> dict[str, str]:
+    """Leave the telemetry opt-out to the VAD, and download its model elsewhere."""
+
+    environment = _scratch_environment(home, temporary)
+    for key in TELEMETRY_OPT_OUTS:
+        environment.pop(key, None)
+    return {**environment, "HF_HOME": str(models)}
 
 
 def _run(
@@ -189,12 +202,17 @@ def _check_commands(
         _run([str(executable), *arguments])
 
 
-def _check_imports(python_bin: Path, modules: Sequence[str], scratch: Path) -> None:
+def _run_in_scratch(
+    command: Sequence[str],
+    scratch: Path,
+    environment: Callable[[Path, Path], dict[str, str]],
+    description: str,
+) -> None:
     home = scratch / "home"
     temporary = scratch / "tmp"
     home.mkdir(parents=True)
     temporary.mkdir()
-    _run(import_command(python_bin, modules), env=import_environment(home, temporary))
+    _run(command, env=environment(home, temporary))
     written = sorted(
         str(path.relative_to(scratch))
         for path in scratch.rglob("*")
@@ -202,9 +220,27 @@ def _check_imports(python_bin: Path, modules: Sequence[str], scratch: Path) -> N
     )
     if written:
         raise SystemExit(
-            f"error: importing {', '.join(modules)} wrote {', '.join(written)}; "
+            f"error: {description} wrote {', '.join(written)}; "
             "a dependency may have started keeping telemetry state"
         )
+
+
+def _check_imports(python_bin: Path, modules: Sequence[str], scratch: Path) -> None:
+    _run_in_scratch(
+        import_command(python_bin, modules),
+        scratch,
+        import_environment,
+        f"importing {', '.join(modules)}",
+    )
+
+
+def _check_vad(python_bin: Path, scratch: Path, models: Path) -> None:
+    _run_in_scratch(
+        vad_check_command(python_bin),
+        scratch,
+        partial(vad_environment, models=models),
+        "the VAD check",
+    )
 
 
 def show_distribution_command(python_bin: Path, name: str) -> list[str]:
@@ -265,7 +301,8 @@ def check_environments(
         _check_imports(python_bin, spec.imports, work / f"{extra}-imports")
         _check_distributions(python_bin, spec.required_distributions)
         _check_commands(environment, spec.commands)
-        print(f"{extra} extra entry points ok")
+        _check_vad(python_bin, work / f"{extra}-vad", work / "huggingface")
+        print(f"{extra} extra entry points and VAD ok")
 
 
 def main(arguments: list[str] | None = None) -> int:

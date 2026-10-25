@@ -94,10 +94,11 @@ wpctl status
 dictate config set dictation.source
 ```
 
-If `dictate vad` triggers on background noise, raise
+If `dictate vad` picks up distant voices or other background sounds, raise
 `dictation.vad_min_speech_rms` or `dictation.vad_start_speech_frames`. If it
-cuts you off mid-sentence, raise `dictation.vad_end_silence_ms`. These apply to
-the next `dictate vad` you start.
+misses quiet speech, lower `dictation.vad_min_speech_rms`. If it cuts you off
+mid-sentence, raise `dictation.vad_end_silence_ms`. These apply to the next
+`dictate vad` you start.
 
 ## The installed unit drifted
 

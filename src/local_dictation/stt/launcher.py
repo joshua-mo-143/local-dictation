@@ -8,11 +8,8 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .. import config
+from ..telemetry import TELEMETRY_OPT_OUTS
 from ..user_config import ComputeDevice, load_user_config
-
-# Recent ONNX Runtime releases keep a device ID and upload usage events from
-# Linux unless this is "1".
-TELEMETRY_OPT_OUTS: Mapping[str, str] = {"ORT_DISABLE_TELEMETRY": "1"}
 
 PROTECTED_ENVIRONMENT_KEYS = frozenset(
     {

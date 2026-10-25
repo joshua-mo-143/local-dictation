@@ -13,7 +13,8 @@ speech engine, how to update, and how to install by hand on other systems.
   libraries. See [CUDA](#cuda).
 - Network access the first time the service starts, to download the model from
   Hugging Face. The Parakeet model takes less than 1 GB in
-  `~/.cache/huggingface`.
+  `~/.cache/huggingface`. The first `dictate vad` also downloads a 2 MB voice
+  activity model.
 - Memory for the model: systemd throttles the service above 4 GB and stops it
   above 6 GB.
 

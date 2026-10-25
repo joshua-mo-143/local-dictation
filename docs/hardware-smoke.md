@@ -71,6 +71,8 @@ Checklist:
 - Each sentence is transcribed and inserted after its pause, and the listener
   rearms between them.
 - Silence and background noise don't produce empty insertions.
+- With steady background noise, such as a fan, each sentence still finishes
+  after its pause instead of running on to `dictation.vad_max_seconds`.
 - The second `dictate vad` stops the listener, and the first process exits.
 
 ## CUDA model loading

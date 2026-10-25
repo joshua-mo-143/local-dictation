@@ -82,9 +82,13 @@ The production-extras check builds the wheel, installs each engine extra into a
 clean environment, and confirms that the entry points work. It imports each
 engine with the launcher's telemetry opt-outs and a scratch home and temporary
 directory, and fails if the import writes anything there, which catches a
-dependency upgrade that starts keeping telemetry state. CI checks every extra
-in a separate job. The cuda and whisper extras are large downloads, so
-locally you can check one extra at a time:
+dependency upgrade that starts keeping telemetry state. It then runs
+`python -m local_dictation.vad --check` the same way, but without the opt-out,
+so the check also proves that the VAD sets it before loading ONNX Runtime. That
+check downloads the 2 MB Silero model and confirms that loud white noise doesn't
+register as speech. CI checks every extra in a separate job. The cuda and
+whisper extras are large downloads, so locally you can check one extra at a
+time:
 
 ```fish
 env PYTHONPATH=src uv run --no-project python -m local_dictation.production_extras \

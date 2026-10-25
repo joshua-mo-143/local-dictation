@@ -50,7 +50,7 @@ vad_start_speech_frames = 3
 | `dictation.replacements` | `DICTATION_REPLACEMENTS` | `spoken:written` pairs separated by `;`; empty disables the defaults |
 | `dictation.vad_end_silence_ms` | `DICTATION_VAD_END_SILENCE_MS` | Silence that finishes a VAD utterance |
 | `dictation.vad_max_seconds` | `DICTATION_VAD_MAX_SECONDS` | Longest VAD utterance |
-| `dictation.vad_min_speech_rms` | `DICTATION_VAD_MIN_SPEECH_RMS` | Energy gate for VAD speech; `0` disables it |
+| `dictation.vad_min_speech_rms` | `DICTATION_VAD_MIN_SPEECH_RMS` | Loudness floor below which VAD ignores sound; `0` disables it |
 | `dictation.vad_start_speech_frames` | `DICTATION_VAD_START_SPEECH_FRAMES` | Consecutive 80 ms speech frames that start a VAD utterance |
 
 `dictation.replacements` may also be a TOML table, such as

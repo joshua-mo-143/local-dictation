@@ -23,7 +23,7 @@ class ProductionExtraSpecTests(unittest.TestCase):
                     spec.commands, (("local-dictation-server", ("--check",)),)
                 )
 
-    def test_core_runs_dictate_help_and_extras_avoid_model_loads(self) -> None:
+    def test_entry_point_checks_avoid_model_loads(self) -> None:
         self.assertEqual(production_extras.CORE_COMMANDS, (("dictate", ("--help",)),))
         for name, arguments in (
             *production_extras.CORE_COMMANDS,
@@ -143,6 +143,15 @@ class ProductionExtraCommandTests(unittest.TestCase):
                 [str(work / extra / "bin/local-dictation-server"), "--check"],
                 recorded,
             )
+            self.assertIn(
+                [
+                    str(work / extra / "bin/python"),
+                    "-m",
+                    "local_dictation.vad",
+                    "--check",
+                ],
+                recorded,
+            )
         self.assertIn(
             [
                 str(work / "cpu/bin/python"),
@@ -206,6 +215,55 @@ class ProductionExtraCommandTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("importing onnxruntime wrote", message)
         self.assertIn("home/.cache/Microsoft/deviceid", message)
+
+    def test_vad_check_leaves_telemetry_to_the_vad_and_downloads_elsewhere(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.dict(
+                production_extras.os.environ,
+                {
+                    "HOME": "/home/example",
+                    "XDG_CACHE_HOME": "/home/example/.cache",
+                    "ORT_DISABLE_TELEMETRY": "1",
+                    "PATH": "/usr/bin",
+                },
+                clear=True,
+            ),
+            mock.patch.object(production_extras, "_run") as run,
+        ):
+            scratch = Path(temporary) / "cpu-vad"
+            models = Path(temporary) / "huggingface"
+            python = Path("/tmp/extra-cpu/bin/python")
+            production_extras._check_vad(python, scratch, models)
+
+        run.assert_called_once_with(
+            [str(python), "-m", "local_dictation.vad", "--check"],
+            env={
+                "PATH": "/usr/bin",
+                "HOME": str(scratch / "home"),
+                "TMPDIR": str(scratch / "tmp"),
+                "HF_HOME": str(models),
+            },
+        )
+
+    def test_vad_check_that_leaves_files_behind_fails(self) -> None:
+        def write_session(_command: list[str], *, env: dict[str, str]) -> None:
+            (Path(env["TMPDIR"]) / ".ses").write_text("session")
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(production_extras, "_run", side_effect=write_session),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            production_extras._check_vad(
+                Path("/tmp/python"),
+                Path(temporary) / "scratch",
+                Path(temporary) / "huggingface",
+            )
+
+        self.assertIn("the VAD check wrote tmp/.ses", str(raised.exception))
 
     def test_missing_entry_point_fails_the_check(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

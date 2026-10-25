@@ -3,7 +3,7 @@
 ```text
 PipeWire microphone
   -> dictate (begin/end/toggle, or vad)
-       -> pw-record, or a raw stream framed by the WebRTC VAD
+       -> pw-record, or a raw stream framed by Silero VAD
        -> immutable recording generation
   -> local-dictation.service over a private Unix socket
        -> Parakeet TDT 0.6B v2 via ONNX Runtime (CPU or CUDA), or
@@ -35,12 +35,19 @@ values before signalling, so a reused PID is never signalled. A cross-process
 `recording.lock` serializes every start, stop, cancel, and hand-off.
 
 `dictate vad` enables hands-free dictation. The invoking process stays running,
-repeatedly owns a raw PipeWire stream, and frames it through an RMS-gated WebRTC
-voice activity detector. It needs several consecutive speech frames before an
-utterance starts, finishes the utterance after the configured silence, then
-transcribes it and listens again, including when STT finds no recognizable
-speech. Running `dictate vad` again signals the owner to stop instead of
-touching its audio.
+repeatedly owns a raw PipeWire stream, and runs each 80 ms frame through the
+[Silero VAD](https://github.com/snakers4/silero-vad) model on one CPU thread.
+Frames quieter than `dictation.vad_min_speech_rms` never count as speech, but
+steady background noise above that level doesn't count either, because the
+model listens for speech rather than loudness. It needs several consecutive
+speech frames before an utterance starts, finishes the utterance after the
+configured silence, then transcribes it and listens again, including when STT
+finds no recognizable speech. Running `dictate vad` again signals the owner to
+stop instead of touching its audio.
+
+The first `dictate vad` downloads the 2 MB model from Hugging Face at a pinned
+revision. Later runs load it from `~/.cache/huggingface` without a network
+request.
 
 ## Hand-off and transcription
 

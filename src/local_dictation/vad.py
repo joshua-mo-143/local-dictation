@@ -1,23 +1,36 @@
 from __future__ import annotations
 
+import argparse
+import os
 import select
 import signal
 import subprocess
+import sys
 import threading
 import wave
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .errors import DictationError
+from .telemetry import TELEMETRY_OPT_OUTS
 from .user_config import DictationSettings
 
 SAMPLE_RATE = 16_000
 FRAME_MS = 80
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
 FRAME_BYTES = FRAME_SAMPLES * 2
-VAD_CHUNK_MS = 20
-VAD_CHUNK_BYTES = SAMPLE_RATE * VAD_CHUNK_MS // 1000 * 2
+
+SILERO_REPOSITORY = "istupakov/silero-vad-onnx"
+SILERO_REVISION = "b3e3ee3cce4c11ceb63b1a0b229d916069c1ddf6"
+SILERO_FILENAME = "silero_vad.onnx"
+# At 16 kHz the model takes 512 new samples per call, preceded by the last 64
+# samples of the previous call.
+SILERO_CHUNK_SAMPLES = 512
+SILERO_CONTEXT_SAMPLES = 64
+START_PROBABILITY = 0.5
+CONTINUE_PROBABILITY = 0.35
 
 
 @dataclass(frozen=True)
@@ -37,36 +50,91 @@ class VadCaptureSettings:
         )
 
 
-class SpeechDetector:
-    """RMS-gated WebRTC voice activity detector for 16-bit mono PCM frames."""
+def load_silero_session() -> Any:
+    """Load the pinned Silero VAD model on one CPU thread, downloading it once."""
 
-    def __init__(self, *, minimum_rms: float, aggressiveness: int = 2) -> None:
+    os.environ.update(TELEMETRY_OPT_OUTS)
+    try:
+        import onnxruntime
+        from huggingface_hub import hf_hub_download
+    except ImportError as error:
+        raise DictationError(
+            "VAD needs ONNX Runtime and huggingface_hub; install local-dictation "
+            "with the cpu, cuda, or whisper extra"
+        ) from error
+    try:
+        model = hf_hub_download(
+            SILERO_REPOSITORY, SILERO_FILENAME, revision=SILERO_REVISION
+        )
+    except Exception as error:
+        raise DictationError(
+            f"couldn't download the Silero VAD model: {error}"
+        ) from error
+    options = onnxruntime.SessionOptions()
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    try:
+        return onnxruntime.InferenceSession(
+            model, sess_options=options, providers=["CPUExecutionProvider"]
+        )
+    except Exception as error:
+        raise DictationError(
+            f"couldn't load the Silero VAD model {model}: {error}"
+        ) from error
+
+
+class SpeechDetector:
+    """Silero voice activity detector for 16-bit mono PCM frames.
+
+    Frames quieter than ``minimum_rms`` never count as speech. Once a frame is
+    speech, later frames stay speech until the model's confidence drops below
+    ``CONTINUE_PROBABILITY``.
+    """
+
+    def __init__(self, *, minimum_rms: float, session: Any | None = None) -> None:
         import numpy as np
-        import webrtcvad
 
         self._np: Any = np
-        self._vad: Any = webrtcvad.Vad(aggressiveness)
+        self._session: Any = load_silero_session() if session is None else session
+        self._sample_rate = np.array(SAMPLE_RATE, dtype=np.int64)
         self.minimum_rms = minimum_rms
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget earlier audio so the next frame starts a new stream."""
+
+        np = self._np
+        self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros(SILERO_CONTEXT_SAMPLES, dtype=np.float32)
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._speaking = False
 
     def is_speech(self, frame: bytes) -> bool:
         if len(frame) != FRAME_BYTES:
             return False
-        samples = self._np.frombuffer(frame, dtype="<i2").astype(self._np.float64)
-        rms = float(self._np.sqrt(self._np.mean(samples * samples)))
-        if rms < self.minimum_rms:
-            return False
-        chunks = [
-            frame[offset : offset + VAD_CHUNK_BYTES]
-            for offset in range(0, len(frame), VAD_CHUNK_BYTES)
-        ]
-        return (
-            sum(
-                self._vad.is_speech(chunk, SAMPLE_RATE)
-                for chunk in chunks
-                if len(chunk) == VAD_CHUNK_BYTES
-            )
-            >= 2
+        np = self._np
+        samples = np.frombuffer(frame, dtype="<i2")
+        rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+        audio = np.concatenate((self._pending, samples.astype(np.float32) / 32768))
+        probability = 0.0
+        while len(audio) >= SILERO_CHUNK_SAMPLES:
+            chunk = audio[:SILERO_CHUNK_SAMPLES]
+            audio = audio[SILERO_CHUNK_SAMPLES:]
+            probability = max(probability, self._probability(chunk))
+        self._pending = audio
+        threshold = CONTINUE_PROBABILITY if self._speaking else START_PROBABILITY
+        self._speaking = probability >= threshold
+        return self._speaking and rms >= self.minimum_rms
+
+    def _probability(self, chunk: Any) -> float:
+        np = self._np
+        window = np.concatenate((self._context, chunk))[np.newaxis, :]
+        output, self._state = self._session.run(
+            ["output", "stateN"],
+            {"input": window, "state": self._state, "sr": self._sample_rate},
         )
+        self._context = chunk[-SILERO_CONTEXT_SAMPLES:]
+        return float(output[0, 0])
 
 
 def _read_frame(
@@ -132,6 +200,7 @@ def capture_vad_audio(
 ) -> str:
     """Wait for speech and capture a WAV until silence or the duration limit."""
 
+    detector.reset()
     command = ["pw-record", "--raw"]
     if source:
         command.extend(("--target", source))
@@ -193,3 +262,42 @@ def capture_vad_audio(
         if process.stderr is not None:
             process.stderr.close()
     return outcome
+
+
+def check_noise_rejection() -> int:
+    """Return how many frames of loud white noise the model heard as silence."""
+
+    import numpy as np
+
+    detector = SpeechDetector(minimum_rms=0)
+    noise = np.random.default_rng(0).normal(0, 3000, FRAME_SAMPLES * 40)
+    pcm = noise.astype("<i2").tobytes()
+    frames = [
+        pcm[offset : offset + FRAME_BYTES] for offset in range(0, len(pcm), FRAME_BYTES)
+    ]
+    heard = sum(detector.is_speech(frame) for frame in frames)
+    if heard:
+        raise DictationError(
+            f"Silero VAD heard speech in {heard} of {len(frames)} frames of white noise"
+        )
+    return len(frames)
+
+
+def main(arguments: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m local_dictation.vad",
+        description="Check that the Silero VAD model loads and ignores white noise",
+    )
+    parser.add_argument("--check", action="store_true", required=True)
+    parser.parse_args(arguments)
+    try:
+        frames = check_noise_rejection()
+    except DictationError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(f"Silero VAD heard no speech in {frames} frames of white noise")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
